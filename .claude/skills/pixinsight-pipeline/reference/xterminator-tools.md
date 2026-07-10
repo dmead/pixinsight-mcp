@@ -10,6 +10,14 @@ All three are **native process modules** (.dylib), NOT scripts.
 | `stars` | bool | false | Create separate star image (**the** key parameter) |
 | `unscreen` | bool | false | Use unscreen method for star extraction |
 | `overlap` | float | 0.20 | Tile overlap (0.05-0.75) |
+| `ai_file` | string | *persisted!* | AI model file — **SET EXPLICITLY** (see below) |
+
+> **Model trap (2026-07-10):** the module's persisted default on the Windows box was
+> `StarXTerminator.lite.nonoise.11.pb` — every PJSR `new StarXTerminator` silently inherits
+> it. Lite models are faster but separate stars from structure less cleanly. The pipeline
+> pins `ai_file='StarXTerminator.11.pb'` (full model) at all five invocation sites. Available
+> models live in `C:\Program Files\PixInsight\library\`. Check `(new StarXTerminator).toSource()`
+> when in doubt — the same persisted-default risk applies to BXT/NXT model selection.
 
 ### Critical Rules
 - **Linear data**: `P.stars = true` only (NO `P.unscreen`). Get starless + stars via subtraction.
@@ -34,6 +42,21 @@ for (var i = 0; i < after.length; i++) {
     }
 }
 ```
+
+### Double-SXT Nebulosity Recovery (Best Practice — pipeline DEFAULT)
+SXT misclassifies compact knots/filament crossings as stars and pulls surrounding
+nebulosity into the star image. Worst on SNR/emission filaments (IC 443 class targets).
+The stolen structure is not lost — it is IN the star image. Recovery:
+1. Run SXT again ON the star image. Its view becomes the leaked nebulosity
+   (the "starless part" of the stars); the new window is the re-extracted clean stars.
+2. Return the leak to the host: `$T + leak` (linear/subtractive extraction) or
+   `~(~$T * ~leak)` (unscreened stars, screen algebra). Flux-conserving by construction.
+3. Use the clean stars for the star branch; close the leak image.
+Pipeline: `sxtRecoverNebulosity()` in run-pipeline.mjs, gated by `recoverNebulosity`
+param (default **true**) on `sxt`/`ha_sxt`/`l_sxt`; in the non-linear star path the leak
+is removed from the stars only (host was already recovered in the linear pass).
+Prevention helps too: keep the SXT AI model current, use larger overlap, don't
+over-smooth before SXT (blobby filaments look like stars).
 
 ### Non-Linear Star Extraction (Best Practice)
 Avoids halo bloating from stretching linear stars:
@@ -82,28 +105,37 @@ P.executeOn(view);
 
 ## BlurXTerminator (BXT)
 
-### Parameters
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `sharpenStars` | float | — | Star sharpening amount |
-| `adjustStarHalos` | float | — | Halo adjustment (negative = reduce) |
-| `sharpenNonstellar` | float | — | Extended feature sharpening |
-| `correctOnly` | bool | false | Only aberration correction, no sharpening |
-| `autoNonstellarPSF` | bool | true | Auto-detect PSF from stars |
-| `nonstellarPSFDiameter` | float | — | Manual PSF diameter (0-8 px) |
-| `luminanceOnly` | bool | false | Process luminance only |
+### Parameters — PJSR property names are **snake_case** (camelCase is silently ignored!)
+| Parameter (PJSR) | Type | Default | Description |
+|------------------|------|---------|-------------|
+| `sharpen_stars` | float | 0.50 | Star sharpening amount |
+| `adjust_halos` | float | 0 | Halo adjustment (negative = reduce) |
+| `sharpen_nonstellar` | float | 0.50 | Extended feature sharpening |
+| `correct_only` | bool | false | Only aberration correction, no sharpening |
+| `correct_first` | bool | false | Correct before sharpen within one run |
+| `nonstellar_then_stellar` | bool | false | Order of operations |
+| `auto_nonstellar_psf` | bool | true | Auto-detect PSF from stars |
+| `nonstellar_psf_diameter` | float | 0 | Manual PSF diameter (0-8 px; 0 = auto) |
+| `lum_only` | bool | false | Process luminance only |
+| `ai_file` | string | — | AI model file (e.g. `BlurXTerminator.4.pb`) |
+
+> ⚠️ **CRITICAL:** BlurXTerminator PJSR properties are snake_case. Assigning the camelCase
+> forms (`sharpenNonstellar`, `correctOnly`, …) does NOT error — it creates an ignored
+> property and BXT runs at DEFAULTS. This silently no-op'd all BXT tuning in the pipeline
+> until 2026-07-09. Verify with `typeof P.sharpen_nonstellar !== 'undefined'`. See
+> pjsr-gotchas.md → "Process Parameter Names".
 
 ### Two-Pass Best Practice
-1. **Pass 1 (correctOnly)** — before color calibration:
+1. **Pass 1 (correct_only)** — before color calibration:
    ```javascript
-   P.correctOnly = true;
-   P.sharpenStars = 0.50;
-   P.sharpenNonstellar = 0.75;
+   P.correct_only = true;
+   P.sharpen_stars = 0.50;
+   P.sharpen_nonstellar = 0.75;   // ignored in correct_only mode
    ```
 2. **Pass 2 (sharpening)** — after color calibration:
    ```javascript
-   P.correctOnly = false;
-   P.sharpenStars = 0.25;
-   P.sharpenNonstellar = 0.50;
-   P.adjustStarHalos = -0.25;
+   P.correct_only = false;
+   P.sharpen_stars = 0.25;
+   P.sharpen_nonstellar = 0.50;
+   P.adjust_halos = -0.25;
    ```

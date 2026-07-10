@@ -139,11 +139,14 @@ const server = http.createServer(async (req, res) => {
   // Serve preview image
   if (req.method === 'GET' && url.pathname.startsWith('/api/preview/')) {
     const stepId = url.pathname.slice('/api/preview/'.length).replace(/[^a-z0-9_]/g, '');
-    const imgPath = path.join(PREVIEW_DIR, stepId + '.jpg');
+    // Previews are PNG (lossless) as of 2026-07-10; fall back to legacy JPG
+    const pngPath = path.join(PREVIEW_DIR, stepId + '.png');
+    const jpgPath = path.join(PREVIEW_DIR, stepId + '.jpg');
+    const imgPath = fs.existsSync(pngPath) ? pngPath : jpgPath;
     if (fs.existsSync(imgPath)) {
       const stat = fs.statSync(imgPath);
       res.writeHead(200, {
-        'Content-Type': 'image/jpeg',
+        'Content-Type': imgPath === pngPath ? 'image/png' : 'image/jpeg',
         'Content-Length': stat.size,
         'Cache-Control': 'no-cache'
       });
@@ -163,10 +166,10 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ previews: {} }));
         return;
       }
-      const files = fs.readdirSync(PREVIEW_DIR).filter(f => f.endsWith('.jpg'));
+      const files = fs.readdirSync(PREVIEW_DIR).filter(f => f.endsWith('.png') || f.endsWith('.jpg'));
       const previews = {};
       for (const f of files) {
-        const id = f.replace('.jpg', '');
+        const id = f.replace(/\.(png|jpg)$/, '');
         const stat = fs.statSync(path.join(PREVIEW_DIR, f));
         previews[id] = { mtime: stat.mtimeMs };
       }

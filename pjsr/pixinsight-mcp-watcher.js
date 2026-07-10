@@ -34,15 +34,31 @@
 #define STAR_CSV_FILE   (File.systemTempDirectory + "/stars-mcp.csv")
 
 // Include AdP dependencies then ImageSolver in library mode
+// (platform-specific install paths — PJSR #include requires literal paths)
+#ifeq __PI_PLATFORM__ MSWINDOWS
+#include "C:/Program Files/PixInsight/src/scripts/AdP/Projections.js"
+#include "C:/Program Files/PixInsight/src/scripts/AdP/WCSmetadata.jsh"
+#include "C:/Program Files/PixInsight/src/scripts/AdP/AstronomicalCatalogs.jsh"
+#include "C:/Program Files/PixInsight/src/scripts/AdP/CommonUIControls.js"
+#include "C:/Program Files/PixInsight/src/scripts/AdP/SearchCoordinatesDialog.js"
+#include "C:/Program Files/PixInsight/src/scripts/AdP/CatalogDownloader.js"
+#endif
+#ifneq __PI_PLATFORM__ MSWINDOWS
 #include "/Applications/PixInsight/src/scripts/AdP/Projections.js"
 #include "/Applications/PixInsight/src/scripts/AdP/WCSmetadata.jsh"
 #include "/Applications/PixInsight/src/scripts/AdP/AstronomicalCatalogs.jsh"
 #include "/Applications/PixInsight/src/scripts/AdP/CommonUIControls.js"
 #include "/Applications/PixInsight/src/scripts/AdP/SearchCoordinatesDialog.js"
 #include "/Applications/PixInsight/src/scripts/AdP/CatalogDownloader.js"
+#endif
 
 #define USE_SOLVER_LIBRARY
+#ifeq __PI_PLATFORM__ MSWINDOWS
+#include "C:/Program Files/PixInsight/src/scripts/AdP/ImageSolver.js"
+#endif
+#ifneq __PI_PLATFORM__ MSWINDOWS
 #include "/Applications/PixInsight/src/scripts/AdP/ImageSolver.js"
+#endif
 
 #define SETTINGS_MODULE_SCRIPT "SOLVER"
 
@@ -588,8 +604,18 @@ function processNextCommand() {
       commandJson = readTextFile(filePath);
       command = JSON.parse(commandJson);
    } catch (e) {
-      console.criticalln("[MCP Watcher] Failed to parse command file: " + filePath + " - " + e.message);
-      deleteFile(filePath);
+      // Likely a read race: the writer may still be mid-write (Win32 sharing
+      // violation / truncated JSON). Deleting here loses the command and stalls
+      // the sender — retry on later polls; drop only after repeated failures.
+      if (typeof __cmdParseFails === 'undefined') __cmdParseFails = {};
+      __cmdParseFails[filePath] = (__cmdParseFails[filePath] || 0) + 1;
+      if (__cmdParseFails[filePath] >= 5) {
+         console.criticalln("[MCP Watcher] Dropping unreadable command file after 5 attempts: " + filePath + " - " + e.message);
+         deleteFile(filePath);
+         delete __cmdParseFails[filePath];
+      } else {
+         console.warningln("[MCP Watcher] Command file busy/partial (attempt " + __cmdParseFails[filePath] + "), will retry: " + filePath);
+      }
       return true;
    }
 
@@ -655,6 +681,17 @@ function runWatcher() {
    console.noteln("===========================================");
 
    var commandCount = 0;
+
+   // Swap on D: — C: filled up 2026-07-10 (PI swap files are hundreds of MB per op
+   // on 5k-6k px frames and the system drive has no headroom for them)
+   try {
+      if ( File.directoryExists( "D:/Temp" ) ) {
+         if ( !File.directoryExists( "D:/Temp/pixinsight-swap" ) )
+            File.createDirectory( "D:/Temp/pixinsight-swap", true );
+         ImageWindow.swapDirectories = [ "D:/Temp/pixinsight-swap" ];
+         console.noteln( "Swap directory: D:/Temp/pixinsight-swap" );
+      }
+   } catch (e) { console.warningln( "Swap redirect failed: " + e.message ); }
 
    console.show();
 

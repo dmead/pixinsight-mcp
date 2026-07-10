@@ -65,10 +65,10 @@ function loadConfig() {
       { id: 'scnr', name: 'SCNR', branch: 'main', enabled: true, params: { amount: 1.0 } },
       { id: 'bxt_sharpen', name: 'BXT (sharpening)', branch: 'main', enabled: true, params: { sharpenStars: 0.25, sharpenNonstellar: 0.50, adjustStarHalos: -0.25 } },
       { id: 'nxt_pass1', name: 'NXT Pass 1', branch: 'main', enabled: true, params: { denoise: 0.30, detail: 0.15 } },
-      { id: 'sxt', name: 'SXT', branch: 'main', enabled: true, params: { overlap: 0.20 } },
+      { id: 'sxt', name: 'SXT', branch: 'main', enabled: true, params: { overlap: 0.20, recoverNebulosity: true } },
       { id: 'star_stretch', name: 'Star Stretch', branch: 'stars', enabled: true, params: { targetBg: 0.50 } },
       { id: 'star_saturate', name: 'Star Saturation', branch: 'stars', enabled: true, params: { starSaturationCurve: [[0,0],[0.35,0.55],[0.65,0.85],[1,1]] } },
-      { id: 'ha_sxt', name: 'Ha SXT', branch: 'ha', enabled: true, params: { overlap: 0.20 } },
+      { id: 'ha_sxt', name: 'Ha SXT', branch: 'ha', enabled: true, params: { overlap: 0.20, recoverNebulosity: true } },
       { id: 'ha_stretch', name: 'Ha Stretch', branch: 'ha', enabled: true, params: { targetBg: 0.25 } },
       { id: 'ha_curves', name: 'Ha Curves', branch: 'ha', enabled: true, params: { haCurve: [[0,0],[0.15,0.10],[0.50,0.55],[0.85,0.92],[1,1]] } },
       { id: 'ha_ghs', name: 'Ha GHS', branch: 'ha', enabled: true, params: { haGHS: { D: 0.5, B: -1.0, LP: 0.02, HP: 0.95 } } },
@@ -124,7 +124,7 @@ async function saveCheckpoint(stepId) {
     const r = await pjsr(`
       var w = ImageWindow.windowById('${viewId}');
       if (w.isNull) throw new Error('View not found: ${viewId}');
-      var p = '${filePath.replace(/'/g, "\\'")}';
+      var p = '${filePath.replace(/\\/g, '/')}';
       if (File.exists(p)) File.remove(p);
       w.saveAs(p, false, false, false, false);
       // saveAs may rename view to match filename — rename back to original
@@ -492,6 +492,76 @@ async function runGC(viewId) {
   }
 }
 
+// DynamicBackgroundExtraction with automatic nebula-aware sampling. Lays a
+// moderate grid, drops only boxes containing a bright star (very high local max),
+// and lets DBE's OWN tolerance-based outlier rejection cull samples that land on
+// nebulosity (they deviate from the fitted background and get flagged bad). This
+// is how DBE is meant to work — a flatness pre-filter fails on LINEAR data where
+// the nebula is faint and every box reads flat. DBE models the smooth background
+// (incl. the corner color gradient) and subtracts it, leaving the nebula.
+//   opts.gridN       grid resolution (default 16 -> up to 16x16 candidates)
+//   opts.boxRadius   px half-size of the star-test box (default 24)
+//   opts.tolerance   DBE outlier rejection sigma (default 0.8 — lower = stricter)
+//   opts.smoothing   DBE spline smoothing (default 0.25)
+//   opts.starReject  drop box if localMax > gMed + starReject*gMADn (default 40)
+async function runDBE(viewId, opts = {}) {
+  const gridN = opts.gridN ?? 16;
+  const boxR = opts.boxRadius ?? 24;
+  const tolerance = opts.tolerance ?? 0.8;
+  const smoothing = opts.smoothing ?? 0.25;
+  const starReject = opts.starReject ?? 40;
+  const beforeIds = (await listImages()).map(i => i.id);
+  const r = await pjsr(`
+    var w = ImageWindow.windowById('${viewId}');
+    var img = w.mainView.image;
+    var W = img.width, H = img.height;
+    var gMed = img.median();
+    var gMADn = img.MAD() * 1.4826;
+    if (gMADn <= 0) gMADn = 1e-6;
+    var margin = 0.02;
+    var samples = [];
+    for (var iy = 0; iy < ${gridN}; iy++) {
+      for (var ix = 0; ix < ${gridN}; ix++) {
+        var xn = margin + (1 - 2*margin) * (ix/(${gridN}-1));
+        var yn = margin + (1 - 2*margin) * (iy/(${gridN}-1));
+        var px = Math.round(xn*W), py = Math.round(yn*H);
+        var x0 = Math.max(0, px-${boxR}), y0 = Math.max(0, py-${boxR});
+        var x1 = Math.min(W, px+${boxR}), y1 = Math.min(H, py+${boxR});
+        img.selectedRect = new Rect(x0, y0, x1, y1);
+        var lMax = img.maximum();
+        img.resetSelections();
+        // drop only boxes with a bright star; DBE tolerance rejects nebula samples
+        if (lMax < gMed + ${starReject}*gMADn) {
+          samples.push([xn, yn, 5, 0, 0, false, 0,0,0,0,0,0]);
+        }
+      }
+    }
+    var P = new DynamicBackgroundExtraction;
+    P.samples = samples;
+    P.imageWidth = W; P.imageHeight = H;
+    P.defaultSampleRadius = 5;
+    P.tolerance = ${tolerance};
+    P.shadowsRelaxation = 3.0;
+    P.minSampleFraction = 0.05;
+    P.smoothing = ${smoothing};
+    P.downsample = 2;
+    P.targetCorrection = DynamicBackgroundExtraction.prototype.Subtract;
+    P.normalize = false;
+    P.discardModel = true;
+    P.replaceTarget = true;
+    P.executeOn(w.mainView);
+    'DBE: ' + samples.length + ' grid samples (DBE tolerance ' + ${tolerance} + ' culls nebula)';
+  `);
+  if (r.status === 'error') log('  [DBE] WARN: ' + r.error.message);
+  else log('  [DBE] ' + (r.outputs?.consoleOutput?.trim() || 'done'));
+  // Close any model images DBE may leave
+  const newImgs = await detectNewImages(beforeIds);
+  if (newImgs.length > 0) {
+    const closeIds = newImgs.map(i => "'" + i.id + "'").join(',');
+    await pjsr(`var ids=[${closeIds}];for(var i=0;i<ids.length;i++){var w=ImageWindow.windowById(ids[i]);if(w&&!w.isNull)w.forceClose();processEvents();}`);
+  }
+}
+
 // Run ABE on a view
 async function runABE(viewId, opts = {}) {
   const polyDegree = opts.polyDegree ?? 4;
@@ -511,16 +581,16 @@ async function runABE(viewId, opts = {}) {
     P.polyDegree = ${polyDegree};
     P.boxSize = 5;
     P.boxSeparation = ${boxSeparation};
-    P.modelImageSampleFormat = AutomaticBackgroundExtractor.prototype.f32;
+    P.modelImageSampleFormat = AutomaticBackgroundExtractor.prototype.ModelFormat_f32;
     P.abeDownsample = 2.00;
     P.writeSampleBoxes = false;
     P.justTrySamples = false;
-    P.targetCorrection = AutomaticBackgroundExtractor.prototype.Subtract;
+    P.targetCorrection = AutomaticBackgroundExtractor.prototype.Correction_Subtract;
     P.normalize = true;
     P.discardModel = true;
     P.replaceTarget = true;
     P.correctedImageId = '';
-    P.correctedImageSampleFormat = AutomaticBackgroundExtractor.prototype.SameAsTarget;
+    P.correctedImageSampleFormat = AutomaticBackgroundExtractor.prototype.CorrectedFormat_SameAsTarget;
     P.verbosity = 0;
     P.executeOn(ImageWindow.windowById('${viewId}').mainView);
   `);
@@ -541,12 +611,17 @@ const PREVIEW_DIR = path.join(home, '.pixinsight-mcp', 'previews');
 // Steps that run on linear data (before stretch) — previews need auto-stretch
 const LINEAR_STEPS = new Set([
   'align', 'combine_rgb', 'gc', 'abe', 'abe_deg2', 'bxt_correct', 'plate_solve', 'spcc', 'scnr',
-  'bxt_sharpen', 'nxt_pass1', 'sxt', 'ha_gc', 'ha_bxt_correct', 'ha_nxt_linear', 'ha_bxt_sharpen',
+  'bxt_sharpen', 'nxt_pass1', 'sxt', 'spfc', 'ha_gc', 'ha_continuum', 'ha_bxt_correct', 'ha_nxt_linear', 'ha_bxt_sharpen',
   'ha_sxt', 'l_sxt', 'l_bxt_correct', 'l_nxt_linear', 'l_bxt_sharpen'
 ]);
 
 async function savePreview(viewId, stepId) {
-  const previewPath = path.join(PREVIEW_DIR, stepId + '.jpg');
+  // Forward-slash paths: backslashes get eaten as JS escapes when interpolated
+  // into the PJSR string literal below (\U \d \p ... collapse, stripping seps).
+  const previewDir = PREVIEW_DIR.replace(/\\/g, '/');
+  // XISF only (Dan, 2026-07-10): PNG and JPEG exports both raise PixInsight warnings
+  // and lose depth; XISF is native, warning-free, and full fidelity. View in PixInsight.
+  const previewPath = path.join(PREVIEW_DIR, stepId + '.xisf').replace(/\\/g, '/');
   const isLinear = LINEAR_STEPS.has(stepId);
   log(`    [preview] Exporting ${stepId} (${isLinear ? 'linear→auto-stretch' : 'non-linear'})...`);
 
@@ -594,10 +669,10 @@ async function savePreview(viewId, stepId) {
       // Full resolution export (no resize)
 
       // Ensure preview dir exists
-      var dir = '${PREVIEW_DIR}';
+      var dir = '${previewDir}';
       if (!File.directoryExists(dir)) File.createDirectory(dir, true);
 
-      // Save as JPEG
+      // Save as XISF (native format — no conversion, no warnings)
       var p = '${previewPath}';
       if (File.exists(p)) File.remove(p);
       tmp.saveAs(p, false, false, false, false);
@@ -605,7 +680,7 @@ async function savePreview(viewId, stepId) {
       'OK';
     `);
     if (r.status === 'error') log('    [preview] WARN: ' + r.error.message);
-    else log('    [preview] Saved: ' + stepId + '.jpg');
+    else log('    [preview] Saved: ' + stepId + '.xisf');
   } catch (e) {
     log('    [preview] ERROR: ' + e.message);
   }
@@ -624,7 +699,12 @@ function send(tool, proc, params, opts) {
       executeMethod: opts?.exec || 'executeGlobal',
       targetView: opts?.view || null
     };
-    fs.writeFileSync(path.join(cmdDir, id + '.json'), JSON.stringify(cmd, null, 2));
+    // Atomic write: the watcher polls *.json and can catch a half-written file
+    // (Win32 error 32 sharing violation → it used to drop the command → 60 min
+    // stall). Write to .tmp, then rename — rename is atomic on the same volume.
+    const cmdPath = path.join(cmdDir, id + '.json');
+    fs.writeFileSync(cmdPath + '.tmp', JSON.stringify(cmd, null, 2));
+    fs.renameSync(cmdPath + '.tmp', cmdPath);
     let att = 0;
     const poll = setInterval(() => {
       const rp = path.join(resDir, id + '.json');
@@ -638,7 +718,11 @@ function send(tool, proc, params, opts) {
         } catch (e) { /* retry */ }
       }
       att++;
-      if (att > 2400) { clearInterval(poll); reject(new Error('Timeout: ' + tool)); }
+      // 7200 * 500ms = 60 min per command. Generous so GPU steps (BXT/NXT/SXT)
+      // that fall back to CPU — e.g. when the GPU is busy with a game — don't
+      // time out mid-op. The watcher can't emit "running" during a blocking
+      // executeOn(), so this ceiling must cover the slowest single CPU step.
+      if (att > 7200) { clearInterval(poll); reject(new Error('Timeout: ' + tool)); }
     }, 500);
   });
 }
@@ -723,6 +807,159 @@ async function getStats(viewId) {
   catch { return { median: 0.01, mad: 0.001 }; }
 }
 
+// Per-channel local background in an annulus around (cx, cy) — the pull target
+// for halo suppression. Using the GLOBAL median tints the suppressed zone when
+// the local field color differs (violet residue on IC 443's Propus).
+async function measureAnnulusBg(viewId, cx, cy, r0, r1) {
+  const r = await pjsr(`
+    var img = ImageWindow.windowById('${viewId}').mainView.image;
+    var sums = [0, 0, 0], n = 0;
+    for (var a = 0; a < 360; a += 2) {
+      for (var rr = ${r0}; rr <= ${r1}; rr += 40) {
+        var th = a * Math.PI / 180;
+        var px = Math.round(${cx} + rr * Math.cos(th)), py = Math.round(${cy} + rr * Math.sin(th));
+        if (px < 0 || py < 0 || px >= img.width || py >= img.height) continue;
+        sums[0] += img.sample(px, py, 0); sums[1] += img.sample(px, py, 1); sums[2] += img.sample(px, py, 2);
+        n++;
+      }
+    }
+    JSON.stringify(n > 0 ? { r: sums[0]/n, g: sums[1]/n, b: sums[2]/n } : null);
+  `);
+  try { return JSON.parse(r.outputs?.consoleOutput || 'null'); }
+  catch { return null; }
+}
+
+// Radial mask PixelMath expression for halo suppression. Gaussian digs a pit
+// narrower than a real reflection halo; Butterworth is flat across the halo
+// and falls off fast at the configured radius — use it for wide halos.
+function haloMaskExpr(h) {
+  const [cx, cy] = h.center;
+  const d2 = `((x()-${cx})*(x()-${cx})+(y()-${cy})*(y()-${cy}))`;
+  if (h.shape === 'butterworth') {
+    const R = h.radius ?? 400;
+    const order = h.order ?? 3;
+    return `(1/(1+exp(${order}*ln(max(${d2},1)/(${R}*${R})))))`; // 1/(1+(d²/R²)^order)
+  }
+  const sigma = h.sigma ?? 250;
+  return `exp(-${d2}/(2*${sigma}*${sigma}))`;
+}
+
+// Star-field metrics via StarDetector (included by the watcher). Returns
+// { count, medFlux, medSize } — used as a guardrail around BXT steps so star
+// erosion shows up as a logged number instead of a surprise in the preview.
+async function measureStarField(viewId) {
+  const r = await pjsr(`
+    var SD = new StarDetector;
+    SD.structureLayers = 5;
+    SD.sensitivity = 0.5;
+    var stars = SD.stars(ImageWindow.windowById('${viewId}').mainView.image);
+    var fluxes = [], sizes = [];
+    for (var i = 0; i < stars.length; i++) {
+      fluxes.push(stars[i].flux);
+      sizes.push(stars[i].size !== undefined ? stars[i].size : (stars[i].rect ? Math.sqrt(stars[i].rect.area) : 0));
+    }
+    fluxes.sort(function(a,b){return a-b;});
+    sizes.sort(function(a,b){return a-b;});
+    JSON.stringify({
+      count: stars.length,
+      medFlux: fluxes.length ? fluxes[Math.floor(fluxes.length/2)] : 0,
+      medSize: sizes.length ? sizes[Math.floor(sizes.length/2)] : 0
+    });
+  `);
+  try { return JSON.parse(r.outputs?.consoleOutput || '{}'); }
+  catch { return null; }
+}
+
+// Guardrail check after a BXT step: warn loudly when the star count drops
+// beyond tolerance (default 5%) — the signature of BXT eating faint stars.
+async function bxtStarGuard(label, before, viewId) {
+  if (!before || !before.count) return;
+  const after = await measureStarField(viewId);
+  if (!after || !after.count) return;
+  const dCount = (after.count - before.count) / before.count * 100;
+  const dSize = before.medSize > 0 ? (after.medSize - before.medSize) / before.medSize * 100 : 0;
+  log(`  [star-guard] ${label}: count ${before.count} -> ${after.count} (${dCount.toFixed(1)}%), medSize ${before.medSize.toFixed(2)} -> ${after.medSize.toFixed(2)}px (${dSize.toFixed(1)}%)`);
+  if (dCount < -5) log(`  [star-guard] WARNING: ${label} lost ${Math.abs(dCount).toFixed(1)}% of detected stars — consider lowering sharpenStars`);
+}
+
+// Load a named filter transmission curve from PixInsight's SPCC filter
+// database (library/filters.xspd). The data attribute is already the CSV
+// format SPCC's *FilterTrCurve parameters expect. Returns null if not found.
+function loadXSPDFilterCurve(name) {
+  const dbPath = process.platform === 'win32'
+    ? 'C:/Program Files/PixInsight/library/filters.xspd'
+    : '/Applications/PixInsight/library/filters.xspd';
+  try {
+    const xml = fs.readFileSync(dbPath, 'utf-8');
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let m = xml.match(new RegExp(`<Filter[^>]*name="${esc}"[^>]*data="([^"]+)"`));
+    if (!m) m = xml.match(new RegExp(`<Filter[^>]*data="([^"]+)"[^>]*name="${esc}"`));
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// star_stretch.saveStarsTo: export the processed star image as XISF so a later
+// run can reuse it via star_add.starsFile (e.g. RGB stars for an SHO palette).
+async function maybeSaveStars(starsId) {
+  const saveTo = P('star_stretch').saveStarsTo;
+  if (!saveTo || !starsId) return;
+  const r = await pjsr(`
+    var w = ImageWindow.windowById('${starsId}');
+    var origId = w.mainView.id;
+    w.saveAs('${saveTo.replace(/\\/g, '/')}', false, false, false, false);
+    if (w.mainView.id != origId) w.mainView.id = origId;
+    'saved';
+  `);
+  log('  ' + (r.status === 'error' ? 'WARN: saveStarsTo failed: ' + r.error.message : `Stars exported: ${saveTo}`));
+}
+
+// Double-SXT nebulosity recovery. SXT misclassifies compact knots and filament
+// crossings as stars and pulls surrounding nebulosity into the star image.
+// Running SXT a second time ON the star image splits it into clean stars (new
+// window) and the leaked nebulosity (in place), which is returned to the host.
+// Linear extraction is additive (stars = original - starless) -> host + leaked.
+// Unscreened stars combine by screen -> ~(~host * ~leaked).
+// Returns the id of the cleaned star image (or the original on failure).
+async function sxtRecoverNebulosity({ hostId, starsId, overlap = 0.20, unscreen = false, addBackToHost = true, label = 'sxt' }) {
+  const before = (await listImages()).map(i => i.id);
+  let r = await pjsr(`
+    var P = new StarXTerminator; P.ai_file='StarXTerminator.11.pb'; P.stars=true; ${unscreen ? 'P.unscreen=true;' : ''} P.overlap=${overlap};
+    P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+  `);
+  if (r.status === 'error') {
+    log('  Recovery WARN: second SXT pass failed: ' + r.error.message + ' — keeping original stars.');
+    return starsId;
+  }
+  const newImgs = await detectNewImages(before);
+  const cleanStarsId = newImgs.length > 0 ? newImgs[0].id : null;
+  if (!cleanStarsId) {
+    log('  Recovery WARN: no clean-stars image detected — keeping original stars.');
+    return starsId;
+  }
+  // starsId now holds the leaked nebulosity (starless part of the star image)
+  const st = await getStats(starsId);
+  log(`  Recovered nebulosity: median=${(st.median ?? 0).toExponential(3)}, max=${(st.max ?? 0).toExponential(3)}` +
+      (addBackToHost ? ` -> returning to ${hostId}` : ' (discarded from stars only)'));
+  await savePreview(starsId, label + '_leak');
+  if (addBackToHost) {
+    const expr = unscreen ? `~(~$T*~${starsId})` : `$T + ${starsId}`;
+    r = await pjsr(`
+      var P = new PixelMath;
+      P.expression = '${expr}';
+      P.useSingleExpression = true;
+      P.createNewImage = false;
+      P.use64BitWorkingImage = true;
+      P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+      P.executeOn(ImageWindow.windowById('${hostId}').mainView);
+    `);
+    log('  ' + (r.status === 'error' ? 'Recovery WARN: add-back failed: ' + r.error.message : 'Nebulosity returned to ' + hostId + '.'));
+  }
+  await pjsr(`var w=ImageWindow.windowById('${starsId}');if(!w.isNull)w.forceClose();processEvents();`);
+  return cleanStarsId;
+}
+
 async function autoStretch(viewId, targetBg = 0.25) {
   const stats = await getStats(viewId);
   log(`    Stats: median=${stats.median.toFixed(6)}, MAD=${stats.mad.toFixed(6)}`);
@@ -740,213 +977,6 @@ async function autoStretch(viewId, targetBg = 0.25) {
   if (r.status === 'error') log('    WARN: ' + r.error.message);
   else log('    Stretched OK.');
   return { stats, shadows: c0, midtone: m };
-}
-
-// ============================================================================
-// Seti Statistical Stretch (faithful port of statisticalstretch.js v2.3)
-// By Franklin Marek (SetiAstro) — CC BY-NC 4.0
-// Handles both mono (L_work) and color (RGB) images with proper expressions.
-// ============================================================================
-async function setiStretch(viewId, opts = {}) {
-  const targetMedian   = opts.targetMedian ?? 0.25;
-  const blackpointSigma = opts.blackpointSigma ?? 5.0;
-  const noBlackClip    = opts.noBlackClip ?? false;
-  const normalize      = opts.normalize ?? false;
-  const hdrCompress    = opts.hdrCompress ?? false;
-  const hdrAmount      = opts.hdrAmount ?? 0.25;
-  const hdrKnee        = opts.hdrKnee ?? 0.35;
-  const hdrHeadroom    = opts.hdrHeadroom ?? 0;
-  const maxIterations  = opts.iterations ?? 1;
-  const convergenceThreshold = 0.001;
-
-  // Detect if image is color
-  const isColorR = await pjsr(`
-    var w = ImageWindow.windowById('${viewId}');
-    w.mainView.image.isColor ? 'color' : 'mono';
-  `);
-  const isColor = (isColorR.outputs?.consoleOutput || '').includes('color');
-
-  const st0 = await getStats(viewId);
-  log(`    Seti stretch [${isColor ? 'color' : 'mono'}]: target=${targetMedian}, bpSigma=${blackpointSigma}, HDR=${hdrCompress}(amount=${hdrAmount},knee=${hdrKnee},headroom=${hdrHeadroom}), maxIter=${maxIterations}`);
-  log(`    Initial: median=${st0.median.toFixed(6)} (${Math.round(st0.median*65535)} ADU), MAD=${st0.mad.toFixed(6)}, max=${(st0.max ?? 0).toFixed(4)}`);
-
-  const T = targetMedian;
-  const noClipFlag = noBlackClip ? '1' : '0';
-
-  for (let iter = 0; iter < maxIterations; iter++) {
-    let r;
-
-    // Step 1: Blackpoint / rescale
-    let bpExpr, bpSymbols;
-    if (isColor) {
-      // Color linked: luma-weighted blackpoint (Rec.709), applied uniformly to all channels
-      bpExpr = [
-        'cr=0.2126; cg=0.7152; cb=0.0722;',
-        'Med = cr*med($T[0]) + cg*med($T[1]) + cb*med($T[2]);',
-        `Sig = 1.4826*(cr*MAD($T[0]) + cg*MAD($T[1]) + cb*MAD($T[2]));`,
-        'MinC = min(min($T[0]),min($T[1]),min($T[2]));',
-        `BPraw = Med - ${blackpointSigma}*Sig;`,
-        `BP = iif(${noClipFlag}, MinC, iif(BPraw < MinC, MinC, BPraw));`,
-        'Rescaled = ($T - BP) / (1 - BP);',
-        'Rescaled;'
-      ].join('\\n');
-      bpSymbols = 'cr,cg,cb,Med,Sig,MinC,BPraw,BP,Rescaled';
-    } else {
-      // Mono: straightforward per-channel
-      bpExpr = [
-        'Med = med($T);',
-        'Sig = 1.4826*MAD($T);',
-        `BPraw = Med - ${blackpointSigma}*Sig;`,
-        `BP = iif(${noClipFlag}, min($T), iif(BPraw < min($T), min($T), BPraw));`,
-        'Rescaled = ($T - BP) / (1 - BP);',
-        'Rescaled;'
-      ].join('\\n');
-      bpSymbols = 'Med, Sig, BPraw, BP, Rescaled';
-    }
-
-    r = await pjsr(`
-      var P = new PixelMath;
-      P.expression = "${bpExpr}";
-      P.useSingleExpression = true;
-      P.symbols = "${bpSymbols}";
-      P.use64BitWorkingImage = true;
-      P.truncate = false;
-      P.createNewImage = false;
-      P.executeOn(ImageWindow.windowById('${viewId}').mainView);
-    `);
-    if (r.status === 'error') { log(`      WARN step1: ${r.error.message}`); break; }
-
-    // Step 2: Midtones transfer (closed-form MTF mapping median → targetMedian)
-    let mtfExpr, mtfSymbols;
-    if (isColor) {
-      // Color linked: use average of 3 channel medians as single median
-      mtfExpr = `MedianColor = avg(Med($T[0]),Med($T[1]),Med($T[2]));\\n((MedianColor-1)*${T}*$T)/(MedianColor*(${T}+$T-1)-${T}*$T)`;
-      mtfSymbols = 'L, MedianColor, S';
-    } else {
-      // Mono: use Med($T) directly
-      mtfExpr = `((Med($T)-1)*${T}*$T)/(Med($T)*(${T}+$T-1)-${T}*$T)`;
-      mtfSymbols = 'L, S';
-    }
-
-    r = await pjsr(`
-      var P = new PixelMath;
-      P.expression = "${mtfExpr}";
-      P.useSingleExpression = true;
-      P.symbols = "${mtfSymbols}";
-      P.use64BitWorkingImage = true;
-      P.truncate = false;
-      P.createNewImage = false;
-      P.executeOn(ImageWindow.windowById('${viewId}').mainView);
-    `);
-    if (r.status === 'error') { log(`      WARN step2: ${r.error.message}`); break; }
-
-    // Step 3: Normalize or truncate
-    if (normalize) {
-      const normExpr = isColor
-        ? 'Mcolor=max(max($T[0]),max($T[1]),max($T[2]));\\n$T/Mcolor;'
-        : '$T/max($T)';
-      r = await pjsr(`
-        var P = new PixelMath;
-        P.expression = "${normExpr}";
-        P.useSingleExpression = true;
-        P.symbols = "Mcolor";
-        P.use64BitWorkingImage = true;
-        P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
-        P.createNewImage = false;
-        P.executeOn(ImageWindow.windowById('${viewId}').mainView);
-      `);
-      if (r.status === 'error') log(`      WARN step3: ${r.error.message}`);
-    } else {
-      r = await pjsr(`
-        var P = new PixelMath;
-        P.expression = "$T";
-        P.useSingleExpression = true;
-        P.use64BitWorkingImage = true;
-        P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
-        P.createNewImage = false;
-        P.executeOn(ImageWindow.windowById('${viewId}').mainView);
-      `);
-    }
-
-    // Step 4: Optional HDR compress (Hermite soft-knee)
-    if (hdrCompress && hdrAmount > 0) {
-      let hdrExpr, hdrSymbols;
-      if (isColor) {
-        // Color: compute luma Y, compress Y, scale RGB uniformly by Yc/Y
-        hdrExpr = [
-          `a = ${hdrAmount};`,
-          `k = ${hdrKnee};`,
-          'k = min(0.999999, max(0.1, k));',
-          'R = $T[0]; G = $T[1]; B = $T[2];',
-          'cr = 0.2126; cg = 0.7152; cb = 0.0722;',
-          'Y = cr*R + cg*G + cb*B;',
-          'hi = Y > k;',
-          't = (Y - k)/(1 - k);',
-          't = min(1, max(0, t));',
-          't2 = t*t;',
-          't3 = t2*t;',
-          'h10 = (t3 - 2*t2 + t);',
-          'h01 = (-2*t3 + 3*t2);',
-          'h11 = (t3 - t2);',
-          'm1 = min(5, max(1, 1 + 4*a));',
-          `ep = ${(1 - hdrHeadroom).toFixed(4)};`,
-          'f = h10*1 + h01*ep + h11*m1;',
-          'Yc = k + (1 - k)*min(1, max(0, f));',
-          's = iif(hi, iif(Y <= 1.0e-10, 1, Yc/Y), 1);',
-          '$T * s;'
-        ].join('\\n');
-        hdrSymbols = 'a,k,x,hi,t,t2,t3,h10,h01,h11,m1,ep,f,y,R,G,B,cr,cg,cb,Y,Yc,s';
-      } else {
-        // Mono: compress pixel values directly
-        hdrExpr = [
-          `a = ${hdrAmount};`,
-          `k = ${hdrKnee};`,
-          'k = min(0.999999, max(0.1, k));',
-          'x = $T;',
-          'hi = x > k;',
-          't = (x - k)/(1 - k);',
-          't = min(1, max(0, t));',
-          't2 = t*t;',
-          't3 = t2*t;',
-          'h10 = (t3 - 2*t2 + t);',
-          'h01 = (-2*t3 + 3*t2);',
-          'h11 = (t3 - t2);',
-          'm1 = min(5, max(1, 1 + 4*a));',
-          `ep = ${(1 - hdrHeadroom).toFixed(4)};`,
-          'f = h10*1 + h01*ep + h11*m1;',
-          'y = k + (1 - k)*min(1, max(0, f));',
-          'iif(hi, y, x);'
-        ].join('\\n');
-        hdrSymbols = 'a,k,x,hi,t,t2,t3,h10,h01,h11,m1,ep,f,y';
-      }
-
-      r = await pjsr(`
-        var P = new PixelMath;
-        P.expression = "${hdrExpr}";
-        P.useSingleExpression = true;
-        P.symbols = "${hdrSymbols}";
-        P.use64BitWorkingImage = true;
-        P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
-        P.createNewImage = false;
-        P.executeOn(ImageWindow.windowById('${viewId}').mainView);
-      `);
-      if (r.status === 'error') log(`      WARN step4 HDR: ${r.error.message}`);
-    }
-
-    // Check convergence
-    const stIter = await getStats(viewId);
-    const diff = Math.abs(stIter.median - targetMedian);
-    log(`    Iter ${iter+1}: median=${stIter.median.toFixed(6)} (${Math.round(stIter.median*65535)} ADU), max=${(stIter.max ?? 0).toFixed(4)}, diff=${diff.toFixed(6)}`);
-
-    if (diff < convergenceThreshold) {
-      log(`    Converged after ${iter+1} iteration(s).`);
-      break;
-    }
-  }
-
-  const stFinal = await getStats(viewId);
-  log(`    Final: median=${stFinal.median.toFixed(6)} (${Math.round(stFinal.median*65535)} ADU), max=${(stFinal.max ?? 0).toFixed(4)}`);
-  return stFinal;
 }
 
 // ============================================================================
@@ -1033,6 +1063,11 @@ function ghsCode(viewId, orgD, B, SP, LP, HP) {
     log(`    WARN: GHS skipped — LP (${LP}) must be < SP (${SP})`);
     return '/* LP>=SP, skipped */';
   }
+  // Prefer the native GeneralizedHyperbolicStretch process module when the
+  // running PixInsight has it installed (parameter map probed 2026-07-09:
+  // stretchFactor=D, localIntensity=b, symmetryPoint=SP, shadowProtection=LP,
+  // highlightProtection=HP). Falls back to the PixelMath port at runtime on
+  // installs without the module.
   const c = computeGHSCoefficients(orgD, B, SP, LP, HP);
   if (!c) return '/* D=0 */';
   const expr = buildGHSExpr(c);
@@ -1042,10 +1077,23 @@ function ghsCode(viewId, orgD, B, SP, LP, HP) {
     return '/* NaN coefficients, skipped */';
   }
   return `
-    var P = new PixelMath; P.expression = '${expr}'; P.useSingleExpression = true;
-    P.createNewImage = false; P.use64BitWorkingImage = true;
-    P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
-    P.executeOn(ImageWindow.windowById('${viewId}').mainView);
+    if (typeof GeneralizedHyperbolicStretch !== 'undefined') {
+      var P = new GeneralizedHyperbolicStretch;
+      P.stretchType = GeneralizedHyperbolicStretch.prototype.ST_GeneralisedHyperbolic;
+      P.stretchChannel = GeneralizedHyperbolicStretch.prototype.SC_RGB;
+      P.stretchFactor = ${orgD};
+      P.localIntensity = ${B};
+      P.symmetryPoint = ${SP};
+      P.shadowProtection = ${LP};
+      P.highlightProtection = ${HP};
+      P.clipType = GeneralizedHyperbolicStretch.prototype.CT_RGBBlend;
+      P.executeOn(ImageWindow.windowById('${viewId}').mainView);
+    } else {
+      var P = new PixelMath; P.expression = '${expr}'; P.useSingleExpression = true;
+      P.createNewImage = false; P.use64BitWorkingImage = true;
+      P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+      P.executeOn(ImageWindow.windowById('${viewId}').mainView);
+    }
   `;
 }
 
@@ -1070,6 +1118,40 @@ function curveToCSV(arr) {
   const parts = [];
   for (const p of arr) parts.push(p[0], p[1]);
   return parts.join(',');
+}
+
+// Parse a flat "λ,t,λ,t,..." curve CSV into [[λ,t],...] points
+function parseCurveCSV(csv) {
+  const t = csv.split(',').map(Number);
+  const pts = [];
+  for (let i = 0; i + 1 < t.length; i += 2) pts.push([t[i], t[i + 1]]);
+  return pts;
+}
+
+// Linear interpolation on curve points; 0 outside the sampled range
+function interpCurve(pts, x) {
+  if (x <= pts[0][0] || x >= pts[pts.length - 1][0]) return 0;
+  for (let i = 1; i < pts.length; i++) {
+    if (x <= pts[i][0]) {
+      const [x0, y0] = pts[i - 1], [x1, y1] = pts[i];
+      return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+    }
+  }
+  return 0;
+}
+
+// Effective bandwidth of a filter+sensor combination: ∫ T(λ)·QE(λ) dλ (trapezoid).
+// Needed to turn per-channel FLUX into flux DENSITY — raw flux units ignore that
+// each filter integrates a different wavelength span, which renders equal-flux
+// sources magenta/green-biased instead of neutral.
+function effectiveBandwidth(filterCsv, qePts) {
+  const f = parseCurveCSV(filterCsv);
+  let area = 0;
+  for (let i = 1; i < f.length; i++) {
+    const [x0, y0] = f[i - 1], [x1, y1] = f[i];
+    area += (x1 - x0) * (y0 * interpCurve(qePts, x0) + y1 * interpCurve(qePts, x1)) / 2;
+  }
+  return area;
 }
 
 // Format curve points to PJSR array literal: [[x,y],[x,y],...]
@@ -1118,7 +1200,7 @@ async function run() {
     log('\n==== PHASE 0: SETUP ====');
 
     // Clear previous preview images so the web UI shows only current run progress
-    const prevFiles = fs.readdirSync(PREVIEW_DIR).filter(f => f.endsWith('.jpg'));
+    const prevFiles = fs.readdirSync(PREVIEW_DIR).filter(f => f.endsWith('.jpg') || f.endsWith('.png') || f.endsWith('.xisf'));
     if (prevFiles.length > 0) {
       for (const f of prevFiles) fs.unlinkSync(path.join(PREVIEW_DIR, f));
       log(`Cleared ${prevFiles.length} previous preview images.`);
@@ -1182,11 +1264,15 @@ async function run() {
       imgs = await listImages();
       const findView = (f) => imgs.find(i => i.id.toUpperCase().indexOf(f) >= 0);
       const findViewRe = (re) => imgs.find(i => re.test(i.id));
-      const viewR = findView('FILTER_R') || findView('FILTER-R') || findViewRe(/[_-]R[_-]/i) || findViewRe(/[_-]R$/i);
-      const viewG = findView('FILTER_G') || findView('FILTER-G') || findView('FILTER_V') || findView('FILTER-V') || findViewRe(/[_-][VG][_-]/i) || findViewRe(/[_-][VG]$/i);
-      const viewB = findView('FILTER_B') || findView('FILTER-B') || findViewRe(/[_-]B[_-]/i) || findViewRe(/[_-]B$/i);
-      const viewHa = hasHa ? (findViewRe(/[_-]ha(?:lpha)?[_-]/i) || findViewRe(/[_-]ha(?:lpha)?$/i)) : null;
-      const viewL2 = hasL ? (findView('FILTER_L') || findView('FILTER-L') || findViewRe(/[_-]L[_-]/i) || findViewRe(/[_-]L$/i)) : null;
+      // Prefer the exact view id reported by open_image for each file — the
+      // config's slot assignment is authoritative (e.g. SII opened as R in an
+      // SHO palette run). Fall back to legacy id-pattern matching.
+      const byOpen = (resp) => resp?.outputs?.id ? imgs.find(i => i.id === resp.outputs.id) : null;
+      const viewR = byOpen(rR) || findView('FILTER_R') || findView('FILTER-R') || findViewRe(/[_-]R[_-]/i) || findViewRe(/[_-]R$/i);
+      const viewG = byOpen(rG) || findView('FILTER_G') || findView('FILTER-G') || findView('FILTER_V') || findView('FILTER-V') || findViewRe(/[_-][VG][_-]/i) || findViewRe(/[_-][VG]$/i);
+      const viewB = byOpen(rB) || findView('FILTER_B') || findView('FILTER-B') || findViewRe(/[_-]B[_-]/i) || findViewRe(/[_-]B$/i);
+      const viewHa = hasHa ? (byOpen(rHa) || findViewRe(/[_-]ha(?:lpha)?[_-]/i) || findViewRe(/[_-]ha(?:lpha)?$/i)) : null;
+      const viewL2 = hasL ? (byOpen(rL) || findView('FILTER_L') || findView('FILTER-L') || findViewRe(/[_-]L[_-]/i) || findViewRe(/[_-]L$/i)) : null;
       if (!viewR || !viewG || !viewB || (hasHa && !viewHa) || (hasL && !viewL2)) { log('FATAL: Missing images. Found: R=' + (viewR?.id||'?') + ' G=' + (viewG?.id||'?') + ' B=' + (viewB?.id||'?') + (hasHa ? ' Ha=' + (viewHa?.id||'?') : '') + (hasL ? ' L=' + (viewL2?.id||'?') : '')); process.exit(1); }
       idR = viewR.id; idG = viewG.id; idB = viewB.id;
       if (hasHa) idHa = viewHa.id;
@@ -1304,20 +1390,28 @@ async function run() {
   // ==== PHASE 0c: PER-CHANNEL GRADIENT CORRECTION ====
   const gcP_pre = P('gc');
   if (isEnabled('gc') && gcP_pre.perChannel && !lOnlyMode && !RESTART_FROM) {
-    log('\n==== PHASE 0c: PER-CHANNEL GRADIENT CORRECTION ====');
+    // DBE crashes in headless automation (dynamic/interactive process) — if
+    // requested, warn and use ABE, which is scriptable and does grid-sampling
+    // with outlier rejection like DBE.
+    let pcMethod = gcP_pre.method || 'gc';
+    if (pcMethod === 'dbe') { log('  NOTE: DBE is not headless-scriptable (crashes) — using ABE per channel instead.'); pcMethod = 'abe'; }
+    if (pcMethod === 'auto') pcMethod = 'gc';
+    log(`\n==== PHASE 0c: PER-CHANNEL BACKGROUND (${pcMethod.toUpperCase()}, per-channel) ====`);
     const channels = [['R', idR], ['G', idG], ['B', idB]];
     if (hasL) channels.push(['L', idL]);
+    const abeDeg = gcP_pre.abePolyDegree ?? 2;
+    const abeTolPc = gcP_pre.abeTolerance ?? 1.0;
     for (const [label, id] of channels) {
       log('  Correcting ' + label + ' (' + id + ')...');
       const before = await measureUniformity(id);
       await cloneImage(id, id + '_gc_bak');
-      await runGC(id);
+      if (pcMethod === 'abe') await runABE(id, { polyDegree: abeDeg, tolerance: abeTolPc }); else await runGC(id);
       const after = await measureUniformity(id);
       if (after.score < before.score) {
-        log('  ' + label + ': GC improved uniformity ' + before.score.toFixed(6) + ' -> ' + after.score.toFixed(6));
+        log('  ' + label + `: ${pcMethod.toUpperCase()} improved uniformity ` + before.score.toFixed(6) + ' -> ' + after.score.toFixed(6));
         await closeImage(id + '_gc_bak');
       } else {
-        log('  ' + label + ': GC did NOT improve (' + before.score.toFixed(6) + ' -> ' + after.score.toFixed(6) + ') — reverting');
+        log('  ' + label + `: ${pcMethod.toUpperCase()} did NOT improve (` + before.score.toFixed(6) + ' -> ' + after.score.toFixed(6) + ') — reverting');
         await restoreFromClone(id, id + '_gc_bak');
         await closeImage(id + '_gc_bak');
       }
@@ -1560,6 +1654,13 @@ async function run() {
       log('  Done.');
       await savePreview(targetName, 'gc');
 
+    } else if (gcMethod === 'dbe') {
+      // DBE with nebula-aware automatic sampling (flatness-gated placement)
+      log(`\n==== PHASE 2: DBE (nebula-aware sampling) ====`);
+      await runDBE(targetName, gcP.dbe || {});
+      log('  Done.');
+      await savePreview(targetName, 'gc');
+
     } else {
       // GC-only mode (default, backward compatible)
       log('\n==== PHASE 2: GradientCorrection ====');
@@ -1577,13 +1678,15 @@ async function run() {
     await maybeCheckpoint('bxt_correct');
     const bxtP = P('bxt_correct');
     log('\n==== PHASE 3: BXT (correctOnly) ====');
+    const sfBefore3 = (bxtP.starGuard ?? true) ? await measureStarField(targetName) : null;
     r = await pjsr(`
-      var P = new BlurXTerminator;
-      P.sharpenStars=${bxtP.sharpenStars ?? 0.50}; P.adjustStarHalos=${bxtP.adjustStarHalos ?? 0.00};
-      P.sharpenNonstellar=${bxtP.sharpenNonstellar ?? 0.75}; P.correctOnly=true;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
+      P.sharpen_stars=${bxtP.sharpenStars ?? 0.50}; P.adjust_halos=${bxtP.adjustStarHalos ?? 0.00};
+      P.sharpen_nonstellar=${bxtP.sharpenNonstellar ?? 0.75}; P.correct_only=true;
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    if (sfBefore3) await bxtStarGuard('bxt_correct', sfBefore3, targetName);
     await savePreview(targetName, 'bxt_correct');
   } else if (!isEnabled('bxt_correct')) {
     log('\n==== PHASE 3: BXT correctOnly (SKIPPED) ====');
@@ -1664,6 +1767,12 @@ async function run() {
     log('\n==== PHASE 3b: Plate Solve (SKIPPED) ====');
   }
 
+  // ==== PHASE 4a: SPFC BEFORE SPCC (Dan, 2026-07-10) ====
+  // Flux calibration first puts the channels on a physical scale; SPCC then does
+  // the spectrophotometric color calibration on top. (Function is hoisted; body
+  // defined below the SPCC phase.)
+  await runSPFC();
+
   // ==== PHASE 4: SPCC + SCNR ====
   if (lOnlyMode && isEnabled('spcc')) {
     log('\n==== PHASE 4: SPCC (SKIPPED — L-only mode) ====');
@@ -1684,18 +1793,44 @@ async function run() {
     log('  ' + (r.status === 'ok' ? r.result : ''));
 
     // Write all SPCC data (curves + white reference spectrum) to temp file
-    // PJSR names alone don't load curve data — must set both name AND data
+    // PJSR names alone don't load curve data — must set both name AND data.
+    // Filter curves: resolved from PixInsight's filters.xspd database when the
+    // configured filterSet is known there; falls back to hardcoded Astronomik.
+    let fRed = { name: 'Astronomik Deep Sky R', curve: curveToCSV(ASTRONOMIK_R) };
+    let fGreen = { name: 'Astronomik Deep Sky G', curve: curveToCSV(ASTRONOMIK_G) };
+    let fBlue = { name: 'Astronomik Deep Sky B', curve: curveToCSV(ASTRONOMIK_B) };
+    const XSPD_SETS = {
+      'Optolong LRGB': { r: 'Optolong R', g: 'Optolong G', b: 'Optolong B' }
+    };
+    const setNames = XSPD_SETS[spccP.filterSet];
+    if (setNames) {
+      const rC = loadXSPDFilterCurve(setNames.r);
+      const gC = loadXSPDFilterCurve(setNames.g);
+      const bC = loadXSPDFilterCurve(setNames.b);
+      if (rC && gC && bC) {
+        fRed = { name: setNames.r, curve: rC };
+        fGreen = { name: setNames.g, curve: gC };
+        fBlue = { name: setNames.b, curve: bC };
+        log(`  Filter curves loaded from filters.xspd: ${setNames.r}/${setNames.g}/${setNames.b}`);
+      } else {
+        log(`  WARN: could not load '${spccP.filterSet}' curves from filters.xspd — using Astronomik fallback`);
+      }
+    } else if (spccP.filterSet && spccP.filterSet !== 'Astronomik Deep Sky') {
+      log(`  WARN: unknown filterSet '${spccP.filterSet}' — using Astronomik fallback`);
+    }
     const spccData = {
       whiteRef: WHITE_REF_AVG_SPIRAL,
-      red: curveToCSV(ASTRONOMIK_R),
-      green: curveToCSV(ASTRONOMIK_G),
-      blue: curveToCSV(ASTRONOMIK_B),
+      red: fRed.curve,
+      green: fGreen.curve,
+      blue: fBlue.curve,
       qe: curveToCSV(SONY_IMX411_QE)
     };
-    fs.writeFileSync('/tmp/spcc-curves.json', JSON.stringify(spccData));
+    const spccTmp = path.join(os.tmpdir(), 'spcc-curves.json');
+    const spccTmpPJSR = spccTmp.replace(/\\/g, '/');
+    fs.writeFileSync(spccTmp, JSON.stringify(spccData));
 
     r = await pjsr(`
-      var json = File.readLines('/tmp/spcc-curves.json').join('');
+      var json = File.readLines('${spccTmpPJSR}').join('');
       var c = JSON.parse(json);
       var P = new SpectrophotometricColorCalibration;
       P.applyCalibration = true;
@@ -1703,11 +1838,11 @@ async function run() {
       P.whiteReferenceSpectrum = c.whiteRef;
       P.whiteReferenceName = '${spccP.whiteReferenceName || 'Average Spiral Galaxy'}';
       P.redFilterTrCurve = c.red;
-      P.redFilterName = 'Astronomik Deep Sky R';
+      P.redFilterName = '${fRed.name}';
       P.greenFilterTrCurve = c.green;
-      P.greenFilterName = 'Astronomik Deep Sky G';
+      P.greenFilterName = '${fGreen.name}';
       P.blueFilterTrCurve = c.blue;
-      P.blueFilterName = 'Astronomik Deep Sky B';
+      P.blueFilterName = '${fBlue.name}';
       P.deviceQECurve = c.qe;
       P.deviceQECurveName = '${spccP.sensorQE || 'Sony IMX411/455/461/533/571'}';
       P.neutralizeBackground = true;
@@ -1758,6 +1893,160 @@ async function run() {
     log('\n==== PHASE 4: SPCC (SKIPPED) ====');
   }
 
+  // ==== PHASE 4a body: SPFC (Spectrophotometric FLUX Calibration) ====
+  // Runs BEFORE SPCC via the runSPFC() call above. Measures per-channel flux scale
+  // from Gaia DR3/SP, applies bandwidth-normalized multipliers, neutralizes the sky
+  // on the darkest tile. SPCC then color-calibrates the flux-scaled channels.
+  async function runSPFC() {
+  if (isEnabled('spfc') && !shouldSkip('spfc')) {
+    await maybeCheckpoint('spfc');
+    const spfcP = P('spfc');
+    log('\n==== PHASE 4b: SPFC (flux calibration) ====');
+
+    let fRed2 = { name: 'Astronomik Deep Sky R', curve: curveToCSV(ASTRONOMIK_R) };
+    let fGreen2 = { name: 'Astronomik Deep Sky G', curve: curveToCSV(ASTRONOMIK_G) };
+    let fBlue2 = { name: 'Astronomik Deep Sky B', curve: curveToCSV(ASTRONOMIK_B) };
+    const XSPD_SETS2 = { 'Optolong LRGB': { r: 'Optolong R', g: 'Optolong G', b: 'Optolong B' } };
+    const setNames2 = XSPD_SETS2[spfcP.filterSet];
+    if (setNames2) {
+      const rC = loadXSPDFilterCurve(setNames2.r);
+      const gC = loadXSPDFilterCurve(setNames2.g);
+      const bC = loadXSPDFilterCurve(setNames2.b);
+      if (rC && gC && bC) {
+        fRed2 = { name: setNames2.r, curve: rC };
+        fGreen2 = { name: setNames2.g, curve: gC };
+        fBlue2 = { name: setNames2.b, curve: bC };
+        log(`  Filter curves loaded from filters.xspd: ${setNames2.r}/${setNames2.g}/${setNames2.b}`);
+      } else {
+        log(`  WARN: could not load '${spfcP.filterSet}' curves — using Astronomik fallback`);
+      }
+    }
+    const spfcData = { red: fRed2.curve, green: fGreen2.curve, blue: fBlue2.curve, qe: curveToCSV(SONY_IMX411_QE) };
+    const spfcTmp = path.join(os.tmpdir(), 'spfc-curves.json');
+    fs.writeFileSync(spfcTmp, JSON.stringify(spfcData));
+
+    // Effective bandwidths (filter × QE) — flux DENSITY normalization. Raw flux
+    // multipliers alone render everything magenta (G integrates a different span
+    // than B); dividing by bandwidth makes an equal-flux-density source neutral.
+    const Wr = effectiveBandwidth(fRed2.curve, SONY_IMX411_QE);
+    const Wg = effectiveBandwidth(fGreen2.curve, SONY_IMX411_QE);
+    const Wb = effectiveBandwidth(fBlue2.curve, SONY_IMX411_QE);
+    log(`  Effective bandwidths (filter×QE): R=${Wr.toFixed(1)} G=${Wg.toFixed(1)} B=${Wb.toFixed(1)} nm`);
+
+    r = await pjsr(`
+      var img=ImageWindow.windowById('${targetName}').mainView.image;
+      img.selectedChannel=0; var mr=img.median();
+      img.selectedChannel=1; var mg=img.median();
+      img.selectedChannel=2; var mb=img.median();
+      img.resetChannelSelection();
+      'pre-SPFC medians: R='+mr.toFixed(6)+' G='+mg.toFixed(6)+' B='+mb.toFixed(6);
+    `);
+    log('  ' + (r.status === 'ok' ? r.result : ''));
+
+    r = await pjsr(`
+      var json = File.readLines('${spfcTmp.replace(/\\/g, '/')}').join('');
+      var c = JSON.parse(json);
+      var P = new SpectrophotometricFluxCalibration;
+      P.narrowbandMode = ${spfcP.narrowbandMode ? 'true' : 'false'};
+      P.redFilterTrCurve = c.red;    P.redFilterName = '${fRed2.name}';
+      P.greenFilterTrCurve = c.green; P.greenFilterName = '${fGreen2.name}';
+      P.blueFilterTrCurve = c.blue;  P.blueFilterName = '${fBlue2.name}';
+      P.deviceQECurve = c.qe;
+      P.deviceQECurveName = '${spfcP.sensorQE || 'Sony IMX411/455/461/533/571'}';
+      P.catalogId = 'GaiaDR3SP';
+      P.autoLimitMagnitude = true;
+      P.limitMagnitude = ${spfcP.limitMagnitude ?? 12.00};
+      P.rejectionLimit = ${spfcP.rejectionLimit ?? 0.30};
+      P.psfStructureLayers = 5;
+      P.saturationThreshold = 0.75;
+      P.saturationRelative = true;
+      P.psfMinSNR = ${spfcP.psfMinSNR ?? 40.00};
+      P.psfType = SpectrophotometricFluxCalibration.prototype.PSFType_Auto;
+      P.psfGrowth = 1.75;
+      P.psfMaxStars = 24576;
+      P.generateGraphs = false;
+      P.generateStarMaps = false;
+      P.generateTextFiles = false;
+      var view = ImageWindow.windowById('${targetName}').mainView;
+      var ret = P.executeOn(view);
+      if (!ret) {
+        'SPFC_FAILED';
+      } else {
+        // SPFC only MEASURES: it stores per-channel counts->flux factors as the
+        // PCL:SPFC:ScaleFactors property and does not touch pixels (verified
+        // 2026-07-10: identical medians pre/post). Apply the factors here,
+        // normalized by the max so data stays in [0,1] and channels end up on a
+        // common physical flux scale — this is the actual color calibration.
+        var sf = view.propertyValue('PCL:SPFC:ScaleFactors');
+        var s0 = sf.at(0), s1 = sf.at(1), s2 = sf.at(2);
+        // flux density = flux / effective bandwidth (computed node-side from the
+        // actual filter curves × sensor QE)
+        var d0 = s0/${Wr}, d1 = s1/${Wg}, d2 = s2/${Wb};
+        var dmax = Math.max(d0, Math.max(d1, d2));
+        var k0 = d0/dmax, k1 = d1/dmax, k2 = d2/dmax;
+        var PM = new PixelMath;
+        PM.expression  = '$T*' + k0;
+        PM.expression1 = '$T*' + k1;
+        PM.expression2 = '$T*' + k2;
+        PM.useSingleExpression = false; PM.createNewImage = false;
+        PM.rescale = false; PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
+        PM.use64BitWorkingImage = true;
+        PM.executeOn(view);
+        // CRITICAL: flux scaling equalizes OBJECT color but not the additive sky
+        // pedestal (light pollution) — after it, channel backgrounds diverge and a
+        // linked stretch clips the low channels to black (v6 first attempt: R/G
+        // died entirely). Neutralize the sky linearly, referenced to the darkest
+        // tile of the frame (real dark-sky pixels).
+        function darkestTileRect(img, T) {
+          var best = 1, bx = 0, by = 0;
+          var lum = img;
+          for (var y = 0; y < img.height - T; y += T)
+            for (var x = 0; x < img.width - T; x += T) {
+              img.selectedRect = new Rect(x, y, x+T, y+T);
+              var m = img.median();
+              if (m < best) { best = m; bx = x; by = y; }
+            }
+          img.resetSelections();
+          return new Rect(bx, by, bx+T, by+T);
+        }
+        var dr = darkestTileRect(view.image, 256);
+        var BN = new BackgroundNeutralization;
+        BN.backgroundReferenceViewId = '';
+        // NB: BN's low/high are ABSOLUTE pixel bounds in [0,1], not sigmas (SPCC's
+        // same-named params are sigmas — they are different processes)
+        BN.backgroundLow = 0.0;
+        BN.backgroundHigh = 0.15;
+        BN.useROI = true;
+        BN.roiX0 = dr.x0; BN.roiY0 = dr.y0; BN.roiX1 = dr.x1; BN.roiY1 = dr.y1;
+        BN.mode = BackgroundNeutralization.prototype.RescaleAsNeeded;
+        BN.executeOn(view);
+        'SPFC applied: factors ' + s0.toExponential(4) + '/' + s1.toExponential(4) + '/' + s2.toExponential(4) +
+        ' -> multipliers ' + k0.toFixed(4) + '/' + k1.toFixed(4) + '/' + k2.toFixed(4) +
+        '; sky neutralized on dark tile (' + dr.x0 + ',' + dr.y0 + ')';
+      }
+    `);
+    if (r.status === 'error') {
+      log('  WARN: SPFC failed (exception) — ' + r.error.message);
+    } else if (r.result === 'SPFC_FAILED') {
+      log('  WARN: SPFC returned false — flux calibration not applied (check WCS/Gaia)');
+    } else {
+      log('  Done. ' + r.result);
+    }
+    r = await pjsr(`
+      var img=ImageWindow.windowById('${targetName}').mainView.image;
+      img.selectedChannel=0; var mr=img.median();
+      img.selectedChannel=1; var mg=img.median();
+      img.selectedChannel=2; var mb=img.median();
+      img.resetChannelSelection();
+      'post-SPFC medians: R='+mr.toFixed(6)+' G='+mg.toFixed(6)+' B='+mb.toFixed(6);
+    `);
+    if (r.status === 'ok') log('  ' + r.result);
+    await savePreview(targetName, 'spfc');
+  } else if (!isEnabled('spfc')) {
+    log('\n==== PHASE 4a: SPFC (SKIPPED) ====');
+  }
+  } // end runSPFC
+
   if (lOnlyMode && isEnabled('scnr')) {
     log('  SCNR (SKIPPED — L-only mode)');
   } else if (isEnabled('scnr') && !shouldSkip('scnr')) {
@@ -1804,13 +2093,15 @@ async function run() {
     await maybeCheckpoint('bxt_sharpen');
     const bxtP = P('bxt_sharpen');
     log('\n==== PHASE 5: BXT (sharpening) ====');
+    const sfBefore5 = (bxtP.starGuard ?? true) ? await measureStarField(targetName) : null;
     r = await pjsr(`
-      var P = new BlurXTerminator;
-      P.sharpenStars=${bxtP.sharpenStars ?? 0.25}; P.adjustStarHalos=${bxtP.adjustStarHalos ?? -0.25};
-      P.sharpenNonstellar=${bxtP.sharpenNonstellar ?? 0.50}; P.correctOnly=false;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
+      P.sharpen_stars=${bxtP.sharpenStars ?? 0.25}; P.adjust_halos=${bxtP.adjustStarHalos ?? -0.25};
+      P.sharpen_nonstellar=${bxtP.sharpenNonstellar ?? 0.50}; P.correct_only=false;
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    if (sfBefore5) await bxtStarGuard('bxt_sharpen', sfBefore5, targetName);
     await savePreview(targetName, 'bxt_sharpen');
   } else if (!isEnabled('bxt_sharpen')) {
     log('\n==== PHASE 5: BXT sharpening (SKIPPED) ====');
@@ -1822,7 +2113,7 @@ async function run() {
     const nxtP = P('nxt_pass1');
     log('\n==== PHASE 6: NXT pass 1 ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.denoise=${nxtP.denoise ?? 0.30}; P.detail=${nxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.30}; P.detail=${nxtP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -1839,12 +2130,20 @@ async function run() {
     log('\n==== PHASE 7: SXT (star removal) ====');
     let beforeSxt = (await listImages()).map(i => i.id);
     r = await pjsr(`
-      var P = new StarXTerminator; P.stars=true; P.overlap=${sxtP.overlap ?? 0.20};
+      var P = new StarXTerminator; P.ai_file='StarXTerminator.11.pb'; P.stars=true; P.overlap=${sxtP.overlap ?? 0.20};
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
     let newStarImgs = await detectNewImages(beforeSxt);
     starsId = newStarImgs.length > 0 ? newStarImgs[0].id : null;
+    if (starsId && (sxtP.recoverNebulosity ?? true)) {
+      log('  Nebulosity recovery (second SXT pass on star image)...');
+      starsId = await sxtRecoverNebulosity({
+        hostId: targetName, starsId,
+        overlap: sxtP.overlap ?? 0.20, unscreen: false,
+        addBackToHost: true, label: 'sxt'
+      });
+    }
     if (starsId) liveImages.stars = starsId;
     if (hasL && !lOnlyMode) liveImages.lum = 'L_work';
     log('  Stars: ' + (starsId || 'NOT DETECTED'));
@@ -1855,65 +2154,99 @@ async function run() {
   }
 
   // ==== PHASE 7b+c: STAR PROCESSING BRANCH ====
-  // Two methods available via star_stretch.params.starMethod:
-  //   "linear" (Seti method) — keep linear stars, clip bg, stretch with MTF iterations, saturate
-  //     Produces tight, point-like stars. Inspired by Seti Astro star stretch script.
-  //     Reference: https://www.setiastro.com (Bill Blanshan / Seti Astro)
-  //   "nonlinear" (default) — close linear stars, re-extract from stretched data with SXT unscreen
-  //     Produces natural display-range stars but can be slightly bloated.
+  // Single method: close the linear stars here and re-extract from stretched
+  // data with SXT unscreen in Phase 8b — natural display-range stars.
+  // (The former "linear"/Seti MTF star stretch was removed 2026-07-09 at Dan's
+  // request; SetiAstro-derived code is excised from the pipeline.)
   const starMethod = (P('star_stretch').starMethod || 'nonlinear').toLowerCase();
   if (starsId && isEnabled('star_stretch') && !shouldSkip('star_stretch')) {
     if (starMethod === 'linear') {
-      log('\n==== PHASE 7b: LINEAR STAR PROCESSING (Seti method) ====');
+      // Linear-subtraction star extraction (REAL pixels — NOT the removed Seti
+      // MTF stretch, and NOT unscreen). The star image from SXT stars=true is
+      // original−starless: whatever SXT carved out of the starless (including a
+      // bright star's saturated core) is preserved here intact, so unscreen's
+      // core-reconstruction deformation on mag-3 stars is avoided entirely.
+      // Display-stretch it with a plain HT (standard PixInsight STF), no MTF loop.
+      log('\n==== PHASE 7b: LINEAR STAR EXTRACTION (real subtraction + HT stretch) ====');
       const starP = P('star_stretch');
-      const setiMidtone = starP.setiMidtone ?? 0.20;
-      const setiIterations = starP.setiIterations ?? 5;
-
-      // Step 1: Clip background pedestal from linear stars
-      log(`  Clipping background pedestal...`);
+      // Clip the background pedestal so the stretch does not lift sky
       r = await pjsr(`
         var v = ImageWindow.windowById('${starsId}').mainView;
-        var stats = v.computeOrFetchProperty('Median');
-        var med = stats.at(0);
+        var med = v.computeOrFetchProperty('Median').at(0);
         if (med > 0.00001) {
           var P = new PixelMath;
           P.expression = 'max(0, ($T - ' + med + ') / (1 - ' + med + '))';
-          P.useSingleExpression = true;
-          P.createNewImage = false;
-          P.use64BitWorkingImage = true;
-          P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+          P.useSingleExpression = true; P.createNewImage = false;
+          P.use64BitWorkingImage = true; P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
           P.executeOn(v);
         }
-        'Clipped: median was ' + med.toFixed(8);
+        'pedestal clipped (med=' + med.toFixed(8) + ')';
       `);
-      log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : r.result));
-
-      // Step 2: Seti star stretch — MTF via PixelMath, N iterations
-      // MTF(m, x) = (1-m)*x / ((1-2*m)*x + m)
-      // This progressively lifts faint stars while constraining bright ones.
-      const a = (1 - setiMidtone).toFixed(6);
-      const b = (1 - 2 * setiMidtone).toFixed(6);
-      const mtfExpr = `(${a}*$T)/((${b})*$T+${setiMidtone.toFixed(6)})`;
-      log(`  Seti stretch: midtone=${setiMidtone}, ${setiIterations} iterations`);
-      log(`    MTF expr: ${mtfExpr}`);
+      log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : r.outputs?.consoleOutput?.trim() || 'clipped'));
+      // GHS stretch with HIGHLIGHT PROTECTION — the key to bright stars. A plain
+      // HT forces a lose-lose: reveal faint stars OR keep a mag-3 star (Propus)
+      // unblown, never both (huge dynamic range). GHS lifts the faint end while
+      // COMPRESSING highlights, so Propus stays a natural amber star instead of
+      // clipping to a white disc. Falls back to a fixed-midtone HT if GHS absent.
+      const starGHS = starP.ghs || {};
+      const ghsD  = starGHS.D  ?? 3.0;    // stretch intensity (faint-star lift)
+      const ghsB  = starGHS.b  ?? 0.0;    // local intensity / curve shape
+      const ghsSP = starGHS.SP ?? 0.02;   // symmetry point — low, near faint-star level
+      const ghsLP = starGHS.LP ?? 0.0;    // shadow protection
+      const ghsHP = starGHS.HP ?? 0.85;   // HIGHLIGHT PROTECTION — keeps bright stars from clipping
+      const bpSigma = starGHS.bpSigma ?? 2.0; // legacy: median + bpSigma*MADN (bpMethod:'sigma')
+      const bpFixed = starGHS.BP;             // optional fixed blackpoint override
+      const bpMethod = starGHS.bpMethod ?? 'darkTile'; // default: darkest tile of the frame
+      const bpTile = starGHS.bpTileSize ?? 256;
+      const starMid = starP.starMidtone ?? 0.12;
       r = await pjsr(`
-        var v = ImageWindow.windowById('${starsId}').mainView;
-        var mtfExpr = '${mtfExpr}';
-        for (var i = 0; i < ${setiIterations}; i++) {
-          var P = new PixelMath;
-          P.expression = mtfExpr;
-          P.useSingleExpression = true;
-          P.createNewImage = false;
-          P.use64BitWorkingImage = true;
-          P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
-          P.executeOn(v);
-          processEvents();
+        function darkestTileMedian(img, T) {
+          var best = 1;
+          for (var y = 0; y < img.height; y += T)
+            for (var x = 0; x < img.width; x += T) {
+              img.selectedRect = new Rect(x, y, Math.min(x+T, img.width), Math.min(y+T, img.height));
+              var m = img.median();
+              if (m < best) best = m;
+            }
+          img.resetSelections();
+          return best;
         }
-        'Done (' + ${setiIterations} + ' passes)';
+        var id = '${starsId}';
+        var v = ImageWindow.windowById(id).mainView;
+        if (typeof GeneralizedHyperbolicStretch !== 'undefined') {
+          // 1) LINEAR BLACKPOINT — clip the sky/noise floor FIRST so the
+          //    hyperbolic stretch lifts stars, not background. Default source:
+          //    the DARKEST TILE of the frame (real dark-sky pixels) — global
+          //    median+sigma is biased upward by galaxy/nebula glow (Dan).
+          var med = v.image.median(), madn = v.image.MAD()*1.4826;
+          var bp = ${bpFixed !== undefined ? bpFixed : (bpMethod === 'sigma' ? `Math.max(0, med + ${bpSigma}*madn)` : `darkestTileMedian(v.image, ${bpTile})`)};
+          var L = new GeneralizedHyperbolicStretch;
+          L.stretchType = GeneralizedHyperbolicStretch.prototype.ST_Linear;
+          L.stretchChannel = GeneralizedHyperbolicStretch.prototype.SC_RGB;
+          L.blackPoint = bp;
+          L.whitePoint = 1.0;
+          L.clipType = GeneralizedHyperbolicStretch.prototype.CT_RGBBlend;
+          L.executeOn(v);
+          // 2) HYPERBOLIC — lift faint stars, protect bright-star highlights
+          var P = new GeneralizedHyperbolicStretch;
+          P.stretchType = GeneralizedHyperbolicStretch.prototype.ST_GeneralisedHyperbolic;
+          P.stretchChannel = GeneralizedHyperbolicStretch.prototype.SC_RGB;
+          P.stretchFactor = ${ghsD};
+          P.localIntensity = ${ghsB};
+          P.symmetryPoint = ${ghsSP};
+          P.shadowProtection = ${ghsLP};
+          P.highlightProtection = ${ghsHP};
+          P.clipType = GeneralizedHyperbolicStretch.prototype.CT_RGBBlend;
+          P.executeOn(v);
+          'GHS: BP=' + bp.toFixed(5) + ' then D=${ghsD} SP=${ghsSP} HP=${ghsHP}';
+        } else {
+          var P = new HistogramTransformation;
+          P.H = [[0,0.5,1,0,1],[0,0.5,1,0,1],[0,0.5,1,0,1],[0,${starMid},1,0,1],[0,0.5,1,0,1]];
+          P.executeOn(v);
+          'HT fallback (midtone=${starMid})';
+        }
       `);
-      log('  Seti stretch: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : r.result));
-
-      // Step 3: Star saturation (if enabled)
+      log('  Star stretch: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : (r.outputs?.consoleOutput?.trim() || 'done')));
       if (isEnabled('star_saturate')) {
         const satP = P('star_saturate');
         await pjsr(`
@@ -1923,12 +2256,29 @@ async function run() {
         `);
         log('  Star saturation applied.');
       }
-
+      // Green-core removal on the RGB star field. Stars are never green, so SCNR
+      // (AverageNeutral, preserveLightness) only clamps the green-core artifact a
+      // bright saturated star can pick up after an aggressive faint-lift stretch
+      // (high GHS b) — real red/blue/white stars are untouched. Opt-in via
+      // star_stretch.scnrGreen (default off to preserve legacy behaviour).
+      if (starP.scnrGreen) {
+        const scnrAmt = (typeof starP.scnrGreen === 'number') ? starP.scnrGreen : 1.0;
+        await pjsr(`
+          var P = new SCNR;
+          P.amount = ${scnrAmt};
+          P.protectionMethod = SCNR.prototype.AverageNeutral;
+          P.colorToRemove = SCNR.prototype.Green;
+          P.preserveLightness = true;
+          P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+        `);
+        log(`  Star SCNR green removal applied (amount=${scnrAmt}).`);
+      }
       liveImages.stars = starsId;
       await savePreview(starsId, 'star_stretch');
+      await maybeSaveStars(starsId);
       log(`  Linear stars ready: ${starsId}`);
     } else {
-      // Default: close linear stars, re-extract from non-linear data in Phase 8b
+      // Close linear stars, re-extract from non-linear data in Phase 8b (unscreen)
       log('\n==== PHASE 7b: CLOSING LINEAR STARS (will re-extract after stretch) ====');
       await pjsr(`var w=ImageWindow.windowById('${starsId}');if(!w.isNull)w.forceClose();`);
       log('  Closed ' + starsId + '. Non-linear extraction in Phase 8b.');
@@ -1956,13 +2306,52 @@ async function run() {
     log('\n==== PHASE 7c1: Ha GC (SKIPPED) ====');
   }
 
+  // ==== PHASE 7c1b: Ha CONTINUUM SUBTRACTION (Ha branch — linear) ====
+  // Raw Ha = line emission + broadband continuum (starlight, galaxy body). Injecting it
+  // reddens everything. Subtract the R master (gradient-corrected, LinearFit-scaled to Ha,
+  // where the fit is dominated by continuum pixels) so only true emission survives.
+  if (isEnabled('ha_continuum') && !shouldSkip('ha_continuum')) {
+    await maybeCheckpoint('ha_continuum');
+    const haCsP = P('ha_continuum');
+    const csFactor = haCsP.factor ?? 1.0;
+    log(`\n==== PHASE 7c1b: Ha CONTINUUM SUBTRACTION (factor=${csFactor}) ====`);
+    r = await pjsr(`
+      var ha = ImageWindow.windowById('Ha_work').mainView;
+      var medBefore = ha.image.median();
+      var arr = ImageWindow.open('${F.R.replace(/\\/g, '/')}');
+      if (arr.length === 0) throw new Error('cannot open R master for continuum');
+      var rw = arr[0];
+      rw.mainView.id = 'R_cont';
+      // match Ha's gradient treatment so the subtraction doesn't reintroduce one
+      var GC = new GradientCorrection;
+      GC.executeOn(rw.mainView);
+      // scale R to Ha's level: global least squares is continuum-dominated
+      var LF = new LinearFit;
+      LF.referenceViewId = 'Ha_work';
+      LF.executeOn(rw.mainView);
+      var PM = new PixelMath;
+      PM.expression = 'max(0, Ha_work - ${csFactor}*R_cont)';
+      PM.useSingleExpression = true; PM.createNewImage = false;
+      PM.rescale = false; PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
+      PM.use64BitWorkingImage = true;
+      PM.executeOn(ha);
+      rw.forceClose();
+      var medAfter = ha.image.median();
+      'continuum subtracted: Ha median ' + medBefore.toFixed(6) + ' -> ' + medAfter.toFixed(6);
+    `);
+    log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : (r.outputs?.consoleOutput || 'Done.')));
+    await savePreview('Ha_work', 'ha_continuum');
+  } else if (!isEnabled('ha_continuum')) {
+    log('\n==== PHASE 7c1b: Ha CONTINUUM SUBTRACTION (SKIPPED) ====');
+  }
+
   // ==== PHASE 7c2: Ha BXT CORRECT (Ha branch — optical correction only, linear) ====
   if (isEnabled('ha_bxt_correct') && !shouldSkip('ha_bxt_correct')) {
     await maybeCheckpoint('ha_bxt_correct');
     const haBxtCP = P('ha_bxt_correct');
     log('\n==== PHASE 7c2: Ha BXT (correctOnly on linear Ha) ====');
     r = await pjsr(`
-      var P = new BlurXTerminator;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
       P.correct_only = true;
       P.sharpen_stars = ${haBxtCP.sharpenStars ?? 0.50};
       P.sharpen_nonstellar = ${haBxtCP.sharpenNonstellar ?? 0.75};
@@ -1981,7 +2370,7 @@ async function run() {
     const haNxtLP = P('ha_nxt_linear');
     log(`\n==== PHASE 7c3: Ha NXT linear (denoise=${haNxtLP.denoise ?? 0.30}, detail=${haNxtLP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.denoise=${haNxtLP.denoise ?? 0.30}; P.detail=${haNxtLP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtLP.denoise ?? 0.30}; P.detail=${haNxtLP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('Ha_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -1996,7 +2385,7 @@ async function run() {
     const haBxtSP = P('ha_bxt_sharpen');
     log('\n==== PHASE 7c4: Ha BXT sharpen (sharpening on linear Ha) ====');
     r = await pjsr(`
-      var P = new BlurXTerminator;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
       P.correct_only = false;
       P.sharpen_stars = ${haBxtSP.sharpenStars ?? 0.25};
       P.sharpen_nonstellar = ${haBxtSP.sharpenNonstellar ?? 0.60};
@@ -2016,12 +2405,21 @@ async function run() {
     log('\n==== PHASE 7d: Ha SXT (star removal from Ha) ====');
     let beforeHaSxt = (await listImages()).map(i => i.id);
     r = await pjsr(`
-      var P = new StarXTerminator; P.stars=true; P.overlap=${haSxtP.overlap ?? 0.20};
+      var P = new StarXTerminator; P.ai_file='StarXTerminator.11.pb'; P.stars=true; P.overlap=${haSxtP.overlap ?? 0.20};
       P.executeOn(ImageWindow.windowById('Ha_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
-    // Close Ha star image (not needed)
+    // Recover leaked nebulosity, then close Ha star image(s) (stars not needed)
     let haStarImgs = await detectNewImages(beforeHaSxt);
+    if (haStarImgs.length > 0 && (haSxtP.recoverNebulosity ?? true)) {
+      log('  Nebulosity recovery (second SXT pass on Ha star image)...');
+      const cleanHaStars = await sxtRecoverNebulosity({
+        hostId: 'Ha_work', starsId: haStarImgs[0].id,
+        overlap: haSxtP.overlap ?? 0.20, unscreen: false,
+        addBackToHost: true, label: 'ha_sxt'
+      });
+      haStarImgs = haStarImgs.slice(1).concat([{ id: cleanHaStars }]);
+    }
     if (haStarImgs.length > 0) {
       const closeIds = haStarImgs.map(i => "'" + i.id + "'").join(',');
       await pjsr(`var ids=[${closeIds}];for(var i=0;i<ids.length;i++){var w=ImageWindow.windowById(ids[i]);if(!w.isNull)w.forceClose();processEvents();}`);
@@ -2039,21 +2437,9 @@ async function run() {
     const haStretchMethod = haStrP.stretchMethod ?? 'auto';
     log(`\n==== PHASE 7e: Ha STRETCH (method=${haStretchMethod}) ====`);
     if (haStretchMethod === 'seti') {
-      log(`  Seti Statistical Stretch on Ha_work...`);
-      await setiStretch('Ha_work', {
-        targetMedian:    haStrP.targetBg ?? 0.15,
-        blackpointSigma: haStrP.blackpointSigma ?? 5.0,
-        noBlackClip:     haStrP.noBlackClip ?? false,
-        normalize:       haStrP.normalize ?? false,
-        hdrCompress:     haStrP.hdrCompress ?? false,
-        hdrAmount:       haStrP.hdrAmount ?? 0.25,
-        hdrKnee:         haStrP.hdrKnee ?? 0.35,
-        hdrHeadroom:     haStrP.hdrHeadroom ?? 0,
-        iterations:      haStrP.iterations ?? 1,
-      });
-    } else {
-      await autoStretch('Ha_work', haStrP.targetBg ?? 0.25);
+      log('  WARN: stretchMethod "seti" removed (SetiAstro code excised) — using HT auto-stretch.');
     }
+    await autoStretch('Ha_work', haStrP.targetBg ?? 0.25);
     await savePreview('Ha_work', 'ha_stretch');
   } else if (!isEnabled('ha_stretch')) {
     log('\n==== PHASE 7e: Ha STRETCH (SKIPPED) ====');
@@ -2065,7 +2451,7 @@ async function run() {
     const haNxtP = P('ha_nxt');
     log(`\n==== PHASE 7e1: Ha NXT (denoise=${haNxtP.denoise ?? 0.50}, detail=${haNxtP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.denoise=${haNxtP.denoise ?? 0.50}; P.detail=${haNxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtP.denoise ?? 0.50}; P.detail=${haNxtP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('Ha_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2079,9 +2465,9 @@ async function run() {
     const lBxtCP = P('l_bxt_correct');
     log('\n==== PHASE 7d2: L BXT CORRECT (linear) ====');
     r = await pjsr(`
-      var P = new BlurXTerminator;
-      P.sharpenStars = ${lBxtCP.sharpenStars ?? 0.50}; P.adjustStarHalos = ${lBxtCP.adjustStarHalos ?? 0.00};
-      P.sharpenNonstellar = ${lBxtCP.sharpenNonstellar ?? 0.75}; P.correctOnly = true;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
+      P.sharpen_stars = ${lBxtCP.sharpenStars ?? 0.50}; P.adjust_halos = ${lBxtCP.adjustStarHalos ?? 0.00};
+      P.sharpen_nonstellar = ${lBxtCP.sharpenNonstellar ?? 0.75}; P.correct_only = true;
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2095,7 +2481,7 @@ async function run() {
     const lNxtLP = P('l_nxt_linear');
     log(`\n==== PHASE 7d3: L NXT LINEAR (denoise=${lNxtLP.denoise ?? 0.25}, detail=${lNxtLP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator;
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
       P.denoise = ${lNxtLP.denoise ?? 0.25}; P.detail = ${lNxtLP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
@@ -2110,9 +2496,9 @@ async function run() {
     const lBxtSP = P('l_bxt_sharpen');
     log('\n==== PHASE 7d4: L BXT SHARPEN (linear) ====');
     r = await pjsr(`
-      var P = new BlurXTerminator;
-      P.sharpenStars = ${lBxtSP.sharpenStars ?? 0.25}; P.adjustStarHalos = ${lBxtSP.adjustStarHalos ?? 0.00};
-      P.sharpenNonstellar = ${lBxtSP.sharpenNonstellar ?? 0.60}; P.correctOnly = false;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
+      P.sharpen_stars = ${lBxtSP.sharpenStars ?? 0.25}; P.adjust_halos = ${lBxtSP.adjustStarHalos ?? 0.00};
+      P.sharpen_nonstellar = ${lBxtSP.sharpenNonstellar ?? 0.60}; P.correct_only = false;
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2130,21 +2516,42 @@ async function run() {
     log('\n==== PHASE 7e2: L SXT (star removal from L) ====');
     let beforeLSxt = (await listImages()).map(i => i.id);
     r = await pjsr(`
-      var P = new StarXTerminator; P.stars=true; P.overlap=${lSxtP.overlap ?? 0.20};
+      var P = new StarXTerminator; P.ai_file='StarXTerminator.11.pb'; P.stars=true; P.overlap=${lSxtP.overlap ?? 0.20};
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
-    // Close L star image (not needed)
+    // Recover leaked nebulosity, then close L star image(s) (stars not needed)
     let lStarImgs = await detectNewImages(beforeLSxt);
+    if (lStarImgs.length > 0 && (lSxtP.recoverNebulosity ?? true)) {
+      log('  Nebulosity recovery (second SXT pass on L star image)...');
+      const cleanLStars = await sxtRecoverNebulosity({
+        hostId: 'L_work', starsId: lStarImgs[0].id,
+        overlap: lSxtP.overlap ?? 0.20, unscreen: false,
+        addBackToHost: true, label: 'l_sxt'
+      });
+      lStarImgs = lStarImgs.slice(1).concat([{ id: cleanLStars }]);
+    }
     if (lStarImgs.length > 0) {
-      const closeIds = lStarImgs.map(i => "'" + i.id + "'").join(',');
-      await pjsr(`var ids=[${closeIds}];for(var i=0;i<ids.length;i++){var w=ImageWindow.windowById(ids[i]);if(!w.isNull)w.forceClose();processEvents();}`);
-      log('  Closed L star image(s).');
+      if (isEnabled('star_lum_blend')) {
+        // Keep the (recovered) L star image — Phase 7e2b transfers its lightness
+        // into the RGB star layer. L stars are BXT-corrected and highest-SNR, so
+        // they define the star profiles; discarding them wastes the best PSFs.
+        await pjsr(`var w=ImageWindow.windowById('${lStarImgs[0].id}');if(!w.isNull)w.mainView.id='stars_L';`);
+        const extraIds = lStarImgs.slice(1).map(i => "'" + i.id + "'").join(',');
+        if (extraIds) await pjsr(`var ids=[${extraIds}];for(var i=0;i<ids.length;i++){var w=ImageWindow.windowById(ids[i]);if(!w.isNull)w.forceClose();processEvents();}`);
+        log('  Kept L stars as stars_L for lum blend.');
+      } else {
+        const closeIds = lStarImgs.map(i => "'" + i.id + "'").join(',');
+        await pjsr(`var ids=[${closeIds}];for(var i=0;i<ids.length;i++){var w=ImageWindow.windowById(ids[i]);if(!w.isNull)w.forceClose();processEvents();}`);
+        log('  Closed L star image(s).');
+      }
     }
     await savePreview('L_work', 'l_sxt');
   } else if (!isEnabled('l_sxt')) {
     log('\n==== PHASE 7e2: L SXT (SKIPPED) ====');
   }
+
+  // (star_lum_blend runs after Phase 8b — see PHASE 8c — so it covers both star methods)
 
   // ==== PHASE 7f: L STRETCH (Lum branch) ====
   // stretchMethod: "ht+ghs" (default) = HT auto-stretch then GHS refinement
@@ -2232,19 +2639,9 @@ async function run() {
       const stFinal = await getStats('L_work');
       log(`    Final L: median=${stFinal.median.toFixed(4)} (${Math.round(stFinal.median*65535)} ADU), max=${(stFinal.max ?? 0).toFixed(4)}`);
     } else if (stretchMethod === 'seti') {
-      // Seti Statistical Stretch (faithful port of statisticalstretch.js v2.3)
-      log(`  Seti Statistical Stretch on L_work...`);
-      await setiStretch('L_work', {
-        targetMedian:    lStrP.targetBg ?? 0.25,
-        blackpointSigma: lStrP.blackpointSigma ?? 5.0,
-        noBlackClip:     lStrP.noBlackClip ?? false,
-        normalize:       lStrP.normalize ?? false,
-        hdrCompress:     lStrP.hdrCompress ?? false,
-        hdrAmount:       lStrP.hdrAmount ?? 0.25,
-        hdrKnee:         lStrP.hdrKnee ?? 0.35,
-        hdrHeadroom:     lStrP.hdrHeadroom ?? 0,
-        iterations:      lStrP.iterations ?? 1,
-      });
+      // SetiAstro Statistical Stretch was removed (2026-07-09) — fall back to HT+GHS default
+      log('  WARN: stretchMethod "seti" removed (SetiAstro code excised) — using HT auto-stretch.');
+      await autoStretch('L_work', lStrP.targetBg ?? 0.25);
       await savePreview('L_work', 'l_stretch');
     } else if (stretchMethod === 'ghs') {
       // GHS-from-linear: 3-phase approach (friend's APOD method)
@@ -2330,7 +2727,7 @@ async function run() {
     const lNxtP = P('l_nxt');
     log('\n==== PHASE 7g: L NXT ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.denoise=${lNxtP.denoise ?? 0.50}; P.detail=${lNxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${lNxtP.denoise ?? 0.50}; P.detail=${lNxtP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2345,9 +2742,9 @@ async function run() {
     const lBxtP = P('l_bxt');
     log('\n==== PHASE 7h: L BXT ====');
     r = await pjsr(`
-      var P = new BlurXTerminator;
-      P.sharpenStars=${lBxtP.sharpenStars ?? 0.25}; P.adjustStarHalos=${lBxtP.adjustStarHalos ?? 0.00};
-      P.sharpenNonstellar=${lBxtP.sharpenNonstellar ?? 0.50}; P.correctOnly=false;
+      var P = new BlurXTerminator; P.ai_file='BlurXTerminator.4.pb';
+      P.sharpen_stars=${lBxtP.sharpenStars ?? 0.25}; P.adjust_halos=${lBxtP.adjustStarHalos ?? 0.00};
+      P.sharpen_nonstellar=${lBxtP.sharpenNonstellar ?? 0.50}; P.correct_only=false;
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2440,7 +2837,7 @@ async function run() {
     const lNxtFP = P('l_nxt_final');
     log(`\n==== PHASE 7j: L NXT FINAL (denoise=${lNxtFP.denoise ?? 0.30}, detail=${lNxtFP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator;
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
       P.denoise = ${lNxtFP.denoise ?? 0.30};
       P.detail = ${lNxtFP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('L_work').mainView);
@@ -2462,19 +2859,9 @@ async function run() {
     log(`\n==== PHASE 8: STRETCH (method=${stretchMethod}) ====`);
 
     if (stretchMethod === 'seti') {
-      // Seti Statistical Stretch for RGB (faithful port of statisticalstretch.js v2.3)
-      log(`  Seti Statistical Stretch on ${targetName}...`);
-      await setiStretch(targetName, {
-        targetMedian:    strP.targetBg ?? 0.25,
-        blackpointSigma: strP.blackpointSigma ?? 5.0,
-        noBlackClip:     strP.noBlackClip ?? false,
-        normalize:       strP.normalize ?? false,
-        hdrCompress:     strP.hdrCompress ?? false,
-        hdrAmount:       strP.hdrAmount ?? 0.25,
-        hdrKnee:         strP.hdrKnee ?? 0.35,
-        hdrHeadroom:     strP.hdrHeadroom ?? 0,
-        iterations:      strP.iterations ?? 1,
-      });
+      // SetiAstro Statistical Stretch was removed (2026-07-09) — fall back to HT auto-stretch
+      log('  WARN: stretchMethod "seti" removed (SetiAstro code excised) — using HT auto-stretch.');
+      mainHT = await autoStretch(targetName, strP.targetBg ?? 0.25);
     } else if (stretchMethod === 'ghs') {
       // GHS-from-linear: same 3-phase approach as validated on L channel
       // useSingleExpression=true in ghsCode applies identically to all RGB channels → colour-preserving
@@ -2568,10 +2955,11 @@ async function run() {
 
   // ==== PHASE 8b: NON-LINEAR STAR EXTRACTION ====
   // Extract stars from stretched data using SXT with unscreen.
-  // Stars are at display brightness — no Seti stretch needed, no bloated halos.
-  // SKIP if starMethod=linear (stars were already processed in Phase 7b).
-  if (starMethod === 'linear' && starsId) {
-    log('\n==== PHASE 8b: NON-LINEAR STAR EXTRACTION (SKIPPED — using linear Seti method) ====');
+  // Stars are at display brightness, screen-blend compatible.
+  // SKIP for starMethod 'linear' — those real-subtraction stars were already
+  // produced and stretched in Phase 7b (unscreen deforms bright saturated cores).
+  if (starMethod === 'linear') {
+    log('\n==== PHASE 8b: NON-LINEAR STAR EXTRACTION (SKIPPED — linear-subtraction stars from 7b) ====');
   } else if (isEnabled('star_stretch') && isEnabled('sxt') && mainHT && !shouldSkip('star_stretch')) {
     const checkpointFile = path.join(CHECKPOINT_DIR, 'checkpoint_sxt_main.xisf');
     if (fs.existsSync(checkpointFile)) {
@@ -2613,7 +3001,7 @@ async function run() {
         let beforeSxt2 = (await listImages()).map(i => i.id);
         const sxtP2 = P('sxt');
         r = await pjsr(`
-          var P = new StarXTerminator; P.stars=true; P.unscreen=true; P.overlap=${sxtP2.overlap ?? 0.10};
+          var P = new StarXTerminator; P.ai_file='StarXTerminator.11.pb'; P.stars=true; P.unscreen=true; P.overlap=${sxtP2.overlap ?? 0.10};
           P.executeOn(ImageWindow.windowById('${tempId}').mainView);
         `);
         log('  SXT: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2621,12 +3009,60 @@ async function run() {
         let newStarImgs2 = await detectNewImages(beforeSxt2);
         starsId = newStarImgs2.length > 0 ? newStarImgs2[0].id : null;
 
+        // Clean leaked nebulosity out of the stars (main starless already got
+        // its recovery in Phase 7 — adding this back would double-count it)
+        if (starsId && (sxtP2.recoverNebulosity ?? true)) {
+          log('  Nebulosity recovery (second SXT pass, unscreen) — cleaning stars only...');
+          starsId = await sxtRecoverNebulosity({
+            hostId: tempId, starsId,
+            overlap: sxtP2.overlap ?? 0.10, unscreen: true,
+            addBackToHost: false, label: 'star_stretch'
+          });
+        }
+
         // Close the temp starless (not needed)
         await pjsr(`var w=ImageWindow.windowById('${tempId}');if(!w.isNull)w.forceClose();`);
 
         if (starsId) {
           liveImages.stars = starsId;
           log(`  Non-linear stars: ${starsId}`);
+
+          // Star-layer hygiene (v9): the unscreen layer inherits noise specks and
+          // faint chroma junk; without a floor clip + denoise, star_saturate turns
+          // them into saturated color confetti across the whole frame.
+          const sxtP3 = P('star_stretch');
+          if (sxtP3.pedestalClip ?? true) {
+            r = await pjsr(`
+              function darkestTileMedian(img, T) {
+                var best = 1;
+                for (var y = 0; y < img.height; y += T)
+                  for (var x = 0; x < img.width; x += T) {
+                    img.selectedRect = new Rect(x, y, Math.min(x+T, img.width), Math.min(y+T, img.height));
+                    var m = img.median();
+                    if (m < best) best = m;
+                  }
+                img.resetSelections();
+                return best;
+              }
+              var v = ImageWindow.windowById('${starsId}').mainView;
+              var ped = darkestTileMedian(v.image, 256);
+              var PM = new PixelMath;
+              PM.expression = 'max(0, ($T - ' + ped + ') / (1 - ' + ped + '))';
+              PM.useSingleExpression = true; PM.createNewImage = false;
+              PM.use64BitWorkingImage = true; PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
+              PM.executeOn(v);
+              'star layer pedestal clipped at ' + ped.toFixed(6) + ' (dark tile)';
+            `);
+            log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : (r.outputs?.consoleOutput?.trim() || 'clipped')));
+          }
+          const layerDenoise = sxtP3.starLayerDenoise ?? 0.25;
+          if (layerDenoise > 0) {
+            r = await pjsr(`
+              var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise = ${layerDenoise}; P.detail = 0.15;
+              P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+            `);
+            log('  Star layer NXT ' + layerDenoise + ': ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+          }
 
           // Star saturation
           if (isEnabled('star_saturate')) {
@@ -2640,6 +3076,7 @@ async function run() {
           }
 
           await savePreview(starsId, 'star_stretch');
+          await maybeSaveStars(starsId);
         } else {
           log('  WARNING: No star image from SXT unscreen.');
         }
@@ -2652,13 +3089,93 @@ async function run() {
     }
   }
 
+  // ==== PHASE 8c: L STAR LIGHTNESS BLEND (stars_L -> star layer) ====
+  // Runs after BOTH star methods have produced liveImages.stars (linear: Phase 7b;
+  // nonlinear/unscreen: Phase 8b). stars_L was kept at l_sxt (BXT-corrected pre-SXT).
+  // It gets pedestal-clipped and GHS-stretched, then LRGBCombination replaces the star
+  // layer's lightness with the L profiles. Blackpoint comes from the darkest tile of
+  // the frame (real dark-sky pixels), NOT median+k*sigma — global stats are biased by
+  // galaxy glow on two-galaxy fields (Dan, 2026-07-10).
+  if (isEnabled('star_lum_blend') && !shouldSkip('star_lum_blend') && liveImages.stars) {
+    const hasStarsL = await pjsr(`ImageWindow.windowById('stars_L').isNull ? 'no' : 'yes'`);
+    if ((hasStarsL.outputs?.consoleOutput || '').indexOf('yes') >= 0) {
+      const blendP = P('star_lum_blend');
+      const sP = P('star_stretch');
+      const sGHS = sP.ghs || {};
+      log('\n==== PHASE 8c: L STAR LIGHTNESS BLEND ====');
+      r = await pjsr(`
+        function darkestTileMedian(img, T) {
+          var best = 1;
+          for (var y = 0; y < img.height; y += T)
+            for (var x = 0; x < img.width; x += T) {
+              img.selectedRect = new Rect(x, y, Math.min(x+T, img.width), Math.min(y+T, img.height));
+              var m = img.median();
+              if (m < best) best = m;
+            }
+          img.resetSelections();
+          return best;
+        }
+        var v = ImageWindow.windowById('stars_L').mainView;
+        // pedestal clip: star images are mostly background — clip at the dark-tile level
+        var ped = darkestTileMedian(v.image, ${sGHS.bpTileSize ?? 256});
+        if (ped > 0.00001) {
+          var PM = new PixelMath;
+          PM.expression = 'max(0, ($T - ' + ped + ') / (1 - ' + ped + '))';
+          PM.useSingleExpression = true; PM.createNewImage = false;
+          PM.use64BitWorkingImage = true; PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
+          PM.executeOn(v);
+        }
+        var out = 'pedestal(darkTile)=' + ped.toFixed(6);
+        if (typeof GeneralizedHyperbolicStretch !== 'undefined') {
+          var bp = darkestTileMedian(v.image, ${sGHS.bpTileSize ?? 256});
+          var L = new GeneralizedHyperbolicStretch;
+          L.stretchType = GeneralizedHyperbolicStretch.prototype.ST_Linear;
+          L.stretchChannel = GeneralizedHyperbolicStretch.prototype.SC_RGB;
+          L.blackPoint = bp; L.whitePoint = 1.0;
+          L.clipType = GeneralizedHyperbolicStretch.prototype.CT_RGBBlend;
+          L.executeOn(v);
+          var G = new GeneralizedHyperbolicStretch;
+          G.stretchType = GeneralizedHyperbolicStretch.prototype.ST_GeneralisedHyperbolic;
+          G.stretchChannel = GeneralizedHyperbolicStretch.prototype.SC_RGB;
+          G.stretchFactor = ${sGHS.D ?? 3.0};
+          G.localIntensity = ${sGHS.b ?? 0.0};
+          G.symmetryPoint = ${sGHS.SP ?? 0.02};
+          G.shadowProtection = ${sGHS.LP ?? 0.0};
+          G.highlightProtection = ${sGHS.HP ?? 0.85};
+          G.clipType = GeneralizedHyperbolicStretch.prototype.CT_RGBBlend;
+          G.executeOn(v);
+          out += ' GHS BP(darkTile)=' + bp.toFixed(6);
+        } else {
+          var HT = new HistogramTransformation;
+          HT.H = [[0,0.5,1,0,1],[0,0.5,1,0,1],[0,0.5,1,0,1],[0,0.12,1,0,1],[0,0.5,1,0,1]];
+          HT.executeOn(v);
+        }
+        // lightness transfer onto the star layer (channels rows R,G,B,L — L LAST)
+        var C = new LRGBCombination;
+        C.channels = [ [false, "", 1.0], [false, "", 1.0], [false, "", 1.0], [true, "stars_L", 1.0] ];
+        C.mL = ${blendP.lightness ?? 0.5};
+        C.mc = ${blendP.saturation ?? 0.5};
+        C.executeOn(ImageWindow.windowById('${liveImages.stars}').mainView);
+        var w = ImageWindow.windowById('stars_L'); if (!w.isNull) w.forceClose();
+        out + ' — L star lightness blended into ${liveImages.stars}';
+      `);
+      log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : (r.outputs?.consoleOutput?.trim() || 'Done.')));
+      await savePreview(liveImages.stars, 'star_lum_blend');
+      await maybeSaveStars(liveImages.stars);
+    } else {
+      log('\n==== PHASE 8c: L STAR BLEND (SKIPPED — no stars_L image) ====');
+    }
+  } else if (!isEnabled('star_lum_blend')) {
+    log('\n==== PHASE 8c: L STAR BLEND (SKIPPED) ====');
+  }
+
   // ==== PHASE 9: NXT pass 2 ====
   if (isEnabled('nxt_pass2') && !shouldSkip('nxt_pass2')) {
     await maybeCheckpoint('nxt_pass2');
     const nxtP = P('nxt_pass2');
     log('\n==== PHASE 9: NXT pass 2 ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.denoise=${nxtP.denoise ?? 0.60}; P.detail=${nxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.60}; P.detail=${nxtP.detail ?? 0.15};
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2768,6 +3285,51 @@ async function run() {
     log('\n==== PHASE 10: CURVES (SKIPPED) ====');
   }
 
+  // ==== PHASE 10c: SHO PALETTE (green temper + amber recovery) ====
+  // For SHO composites: pulls Ha-green toward gold and re-amplifies the SII/Ha
+  // ratio so SII-dominant shock fronts read amber. Blue (OIII) is protected
+  // structurally: green is only tempered toward (R+B)/2, so a strong B raises
+  // the neutral point and the OIII rim keeps its teal.
+  //   greenTemper: 0..1 — fraction of G's excess over (R+B)/2 removed
+  //   amberBoost:  gain on R where R exceeds tempered G (SII-dominant pixels)
+  //   blueBoost:   simple multiplier on B (OIII presence)
+  if (isEnabled('sho_palette') && !shouldSkip('sho_palette')) {
+    const shoP = P('sho_palette');
+    const gt = shoP.greenTemper ?? 0.45;
+    const ab = shoP.amberBoost ?? 0.9;
+    const bb = shoP.blueBoost ?? 1.2;
+    // Ratio-driven OIII vein enhancement: boost B only where OIII is locally
+    // strong relative to Ha (B > veinThreshold*G) — the physical veins — rather
+    // than lifting the whole channel (which mostly amplifies rim + noise).
+    const vb = shoP.veinBoost ?? 0;
+    const vt = shoP.veinThreshold ?? 0.5;
+    // Signal gate: B ≈ G in the NEUTRAL background too, so an ungated vein term
+    // blue-lifts the whole dark field (violet cast, iter-5). Only fire where Ha
+    // emission is actually present.
+    const vf = shoP.veinSignalFloor ?? 0.24;
+    const vtr = shoP.veinSignalTransition ?? 0.06;
+    log(`\n==== PHASE 10c: SHO PALETTE (greenTemper=${gt}, amberBoost=${ab}, blueBoost=${bb}, veinBoost=${vb}@${vt}, veinGate=${vf}/${vtr}) ====`);
+    const neutral = `(($T[0]+$T[2])/2)`;
+    const gTempered = `($T[1] - ${gt}*max(0, $T[1] - ${neutral}))`;
+    const veinGate = `min(1, max(0, ($T[1] - ${vf})/${vtr}))`;
+    const veinTerm = vb > 0 ? ` + ${vb}*max(0, $T[2] - ${vt}*$T[1])*${veinGate}` : '';
+    r = await pjsr(`
+      var P = new PixelMath;
+      P.expression  = '$T[0] + ${ab}*max(0, $T[0] - ${gTempered})';
+      P.expression1 = '${gTempered}';
+      P.expression2 = 'min(1, $T[2]*${bb}${veinTerm})';
+      P.useSingleExpression = false;
+      P.createNewImage = false;
+      P.use64BitWorkingImage = true;
+      P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+      P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+    `);
+    log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    await savePreview(targetName, 'sho_palette');
+  } else if (!isEnabled('sho_palette')) {
+    log('\n==== PHASE 10c: SHO PALETTE (SKIPPED) ====');
+  }
+
   // ==== PHASE 11a: Ha CURVES (Ha branch) ====
   if (isEnabled('ha_curves') && !shouldSkip('ha_curves')) {
     await maybeCheckpoint('ha_curves');
@@ -2872,17 +3434,23 @@ async function run() {
       log('  R channel: preserved (lumOnly mode)');
     }
 
-    // Part 2: LRGB combine with Ha as luminance (adds structural detail to all channels)
+    // Part 2: partial luminance transfer from Ha (adds structural detail to all
+    // channels). PixelMath CIE-Y ratio scaling honors lumBoost as a true blend
+    // weight and respects the active nebula mask. (LRGBCombination's PJSR
+    // interface changed in PI 1.9.4 — old channelL/lightness props were dead.)
     if (lumBoost > 0) {
+      const YHa = `(0.2126*$T[0]+0.7152*$T[1]+0.0722*$T[2])`;
+      const YbHa = `(${YHa}*(1-${lumBoost})+Ha_work*${lumBoost})`;
       r = await pjsr(`
-        var P=new LRGBCombination;
-        P.channelL=[true,'Ha_work'];
-        P.channelR=[false,'']; P.channelG=[false,'']; P.channelB=[false,''];
-        P.lightness=${lumBoost}; P.saturation=0.50;
-        P.noiseReduction=false;
+        var P = new PixelMath;
+        P.expression = '$T*max(${YbHa},0.00001)/max(${YHa},0.00001)';
+        P.useSingleExpression = true;
+        P.createNewImage = false;
+        P.use64BitWorkingImage = true;
+        P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
         P.executeOn(ImageWindow.windowById('${targetName}').mainView);
       `);
-      log('  Lum boost: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+      log('  Lum boost (Y transfer): ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
     }
 
     // Part 3: Ha detail layer — adds high-frequency Ha structure to ALL channels
@@ -3004,12 +3572,19 @@ async function run() {
     log('  ' + (fitR.outputs?.consoleOutput?.trim() || fitR.error?.message || 'Done'));
     } // end else (LinearFit)
 
+    // PI 1.9.4 LRGBCombination interface: single channels table [enabled,id,k]
+    // in R,G,B,L row order (probed 2026-07-09; L-last verified by mean-shift
+    // test), mL/mc replace the old lightness/saturation properties.
     r = await pjsr(`
       var P = new LRGBCombination;
-      P.channelL = [true, 'L_work'];
-      P.channelR = [false, '']; P.channelG = [false, '']; P.channelB = [false, ''];
-      P.lightness = ${lrgbLightness};
-      P.saturation = ${lrgbSaturation};
+      P.channels = [
+        [false, "", 1.0],
+        [false, "", 1.0],
+        [false, "", 1.0],
+        [true, 'L_work', 1.0]
+      ];
+      P.mL = ${lrgbLightness};
+      P.mc = ${lrgbSaturation};
       P.noiseReduction = false;
       var ret = P.executeOn(ImageWindow.windowById('${targetName}').mainView);
       ret ? 'LRGB_OK' : 'LRGB_FAILED';
@@ -3087,6 +3662,73 @@ async function run() {
     await savePreview(targetName, 'shadow_lift');
   }
 
+  // ==== PHASE 11e2: HALO SUPPRESSION (before LHE so local contrast never textures the halo) ====
+  // Pulls a bright star's residual scattered-light halo down toward the local
+  // background with a Gaussian radial mask. SXT removes star cores but leaves
+  // broad reflection halos in the starless image (e.g. Propus/η Gem on IC 443).
+  //   center: [x, y] px; sigma: Gaussian radius px; amount: 0..1 max pull
+  if (isEnabled('halo_suppress') && !shouldSkip('halo_suppress')) {
+    const hsP = P('halo_suppress');
+    const halos = hsP.halos || [];
+    log(`\n==== PHASE 11e2: HALO SUPPRESSION (${halos.length} halo(s)) ====`);
+    for (const h of halos) {
+      const [cx, cy] = h.center;
+      const amount = h.amount ?? 0.6;
+      const desat = h.desaturate ?? 0.6;
+      const m = haloMaskExpr(h);
+      const R0 = (h.shape === 'butterworth' ? (h.radius ?? 400) : (h.sigma ?? 250) * 2);
+      log(`  Suppressing halo at (${cx}, ${cy}), shape=${h.shape ?? 'gaussian'}, ` +
+          (h.shape === 'butterworth' ? `radius=${h.radius ?? 400}, order=${h.order ?? 3}` : `sigma=${h.sigma ?? 250}`) +
+          `, amount=${amount}, desat=${desat}`);
+      // Pull target: by default the LOCAL per-channel background (annulus
+      // outside the halo). But for a very bright star whose annulus clips
+      // nearby bright structure (e.g. Propus with the SNR just below it), the
+      // annulus reads too high and leaves a lit disc. `pullTo` overrides with a
+      // fixed neutral level (the true dark-sky floor) so the glow FADES OUT
+      // instead of filling to a bright plateau. 'black' == 0.
+      const pullTo = (h.pullTo === 'black') ? 0 : (typeof h.pullTo === 'number' ? h.pullTo : undefined);
+      let bg = null;
+      if (pullTo === undefined) {
+        bg = await measureAnnulusBg(targetName, cx, cy, Math.round(R0 * 1.2), Math.round(R0 * 1.5));
+        if (bg) log(`  Local background: R=${bg.r.toFixed(4)} G=${bg.g.toFixed(4)} B=${bg.b.toFixed(4)}`);
+      } else {
+        log(`  Pull target (fixed): ${pullTo} (neutral dark-sky floor)`);
+      }
+      const tgt = (c) => (pullTo !== undefined) ? pullTo.toFixed(6) : (bg ? bg[c].toFixed(6) : 'median($T)');
+      r = await pjsr(`
+        var P = new PixelMath;
+        P.expression  = '$T*(1-${amount}*${m}) + ${tgt('r')}*${amount}*${m}';
+        P.expression1 = '$T*(1-${amount}*${m}) + ${tgt('g')}*${amount}*${m}';
+        P.expression2 = '$T*(1-${amount}*${m}) + ${tgt('b')}*${amount}*${m}';
+        P.useSingleExpression = false;
+        P.createNewImage = false;
+        P.use64BitWorkingImage = true;
+        P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+        P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+      `);
+      log('  Pull-to-local-bg: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+      // Desaturate residual color inside the mask: any leftover halo tint
+      // (red scatter × blueBoost = purple) collapses to neutral luminance.
+      if (desat > 0) {
+        const Y = `(0.2126*$T[0]+0.7152*$T[1]+0.0722*$T[2])`;
+        r = await pjsr(`
+          var P = new PixelMath;
+          P.expression  = '$T[0]*(1-${desat}*${m}) + ${Y}*${desat}*${m}';
+          P.expression1 = '$T[1]*(1-${desat}*${m}) + ${Y}*${desat}*${m}';
+          P.expression2 = '$T[2]*(1-${desat}*${m}) + ${Y}*${desat}*${m}';
+          P.useSingleExpression = false;
+          P.createNewImage = false;
+          P.use64BitWorkingImage = true;
+          P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+          P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+        `);
+        log('  In-mask desaturation: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+      }
+    }
+    await savePreview(targetName, 'halo_suppress');
+  } else if (!isEnabled('halo_suppress')) {
+    log('\n==== PHASE 11e2: HALO SUPPRESSION (SKIPPED) ====');
+  }
   // ==== PHASE 11e3: LHE LARGE (structural tonal separation — arm vs interarm) ====
   if (isEnabled('lhe_large') && !shouldSkip('lhe_large')) {
     const lheLgP = P('lhe_large');
@@ -3608,7 +4250,7 @@ async function run() {
     const nxtFDetail = nxtFP.detail ?? 0.15;
     log(`\n==== PHASE 11i: NXT FINAL (denoise=${nxtFDenoise}, detail=${nxtFDetail}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator;
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
       P.denoise = ${nxtFDenoise}; P.detail = ${nxtFDetail};
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
@@ -3987,7 +4629,113 @@ async function run() {
     log('\n==== PHASE 12b: STAR REDUCTION (SKIPPED) ====');
   }
 
+  // ==== PHASE 12z: CHROMA DENOISE (color-noise reduction, luminance-protected) ====
+  // Kills color speckle (esp. SII/red in SHO, amplified by amberBoost) WITHOUT
+  // touching structure: extract CIE L*a*b*, smooth ONLY a*/b* (chroma), recombine
+  // with L* untouched. Runs on the nebula BEFORE star_add so RGB star colors stay
+  // pristine. Per-axis sigma from noise characterisation — b* usually carries more
+  // low-frequency (blotchy) noise than a*, so it gets a larger kernel.
+  //   sigmaA / sigmaB: Gaussian sigma (px) for a* / b* chroma smoothing
+  if (isEnabled('chroma_denoise') && !shouldSkip('chroma_denoise')) {
+    const cdP = P('chroma_denoise');
+    const sigmaA = cdP.sigmaA ?? 3.5;
+    const sigmaB = cdP.sigmaB ?? 5.0;
+    log(`\n==== PHASE 12z: CHROMA DENOISE (a*σ=${sigmaA}, b*σ=${sigmaB}, L* protected) ====`);
+    r = await pjsr(`
+      var src = ImageWindow.windowById('${targetName}').mainView;
+      var ce = new ChannelExtraction;
+      ce.colorSpace = ChannelExtraction.prototype.CIELab;
+      ce.channels = [[true,'cd_L'],[true,'cd_a'],[true,'cd_b']];
+      ce.executeOn(src);
+      function conv(id, sig){
+        var P = new Convolution;
+        P.mode = Convolution.prototype.Parametric;
+        P.sigma = sig; P.shape = 2.0; P.aspectRatio = 1; P.rotationAngle = 0;
+        P.executeOn(ImageWindow.windowById(id).mainView);
+      }
+      conv('cd_a', ${sigmaA});
+      conv('cd_b', ${sigmaB});
+      var cc = new ChannelCombination;
+      cc.colorSpace = ChannelCombination.prototype.CIELab;
+      cc.channels = [[true,'cd_L'],[true,'cd_a'],[true,'cd_b']];
+      cc.executeOn(src);
+      ['cd_L','cd_a','cd_b'].forEach(function(i){ var w=ImageWindow.windowById(i); if(w&&!w.isNull) w.forceClose(); });
+      'chroma denoise done';
+    `);
+    log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    await savePreview(targetName, 'chroma_denoise');
+  } else if (!isEnabled('chroma_denoise')) {
+    log('\n==== PHASE 12z: CHROMA DENOISE (SKIPPED) ====');
+  }
+
+
   // ==== PHASE 13: STAR ADDITION (Main, merges Stars) ====
+  // star_add.starsFile: use an externally produced star image (e.g. RGB stars
+  // for an SHO palette run) instead of this run's own star branch.
+  {
+    const starAddP = P('star_add');
+    if (isEnabled('star_add') && starAddP.starsFile && !shouldSkip('star_add')) {
+      if (fs.existsSync(starAddP.starsFile)) {
+        log(`\n  Loading external star image: ${starAddP.starsFile}`);
+        const extR = await send('open_image', '__internal__', { filePath: starAddP.starsFile });
+        if (extR.status !== 'error' && extR.outputs?.id) {
+          if (starsId) await closeLiveImage('stars'); // discard this run's own stars
+          starsId = extR.outputs.id;
+          liveImages.stars = starsId;
+          log(`  External stars: ${starsId}`);
+          // Core-protected halo suppression in the star image: the broadband
+          // star image re-deposits its own reflection halo at blend time, so
+          // suppress the same halos configured in halo_suppress — minus a
+          // small core Gaussian so the star itself is untouched.
+          const hsP2 = P('halo_suppress');
+          if ((starAddP.suppressHalosInStars ?? true) && isEnabled('halo_suppress') && (hsP2.halos || []).length > 0) {
+            for (const h of hsP2.halos) {
+              const [cx, cy] = h.center;
+              const amount = h.starsAmount ?? h.amount ?? 0.6;
+              const sdesat = h.starsDesaturate ?? h.desaturate ?? 0;
+              const core = h.coreSigma ?? 30;
+              log(`  Cleaning star-image halo at (${cx}, ${cy}), shape=${h.shape ?? 'gaussian'}, core=${core}, amount=${amount}, desat=${sdesat}`);
+              const mh = haloMaskExpr(h);
+              const mc = `exp(-((x()-${cx})*(x()-${cx})+(y()-${cy})*(y()-${cy}))/(2*${core}*${core}))`;
+              const ann = `max(0, ${mh}-${mc})`; // annulus: halo minus protected core
+              // Desaturate the extracted halo toward neutral (kills the green
+              // SXT-halo tint without touching brightness → no hard edge), then
+              // apply a light brightness pull. Chroma-only desat carries the load.
+              if (sdesat > 0) {
+                const Ys = `(0.2126*$T[0]+0.7152*$T[1]+0.0722*$T[2])`;
+                r = await pjsr(`
+                  var P = new PixelMath;
+                  P.expression  = '$T[0]*(1-${sdesat}*${ann}) + ${Ys}*${sdesat}*${ann}';
+                  P.expression1 = '$T[1]*(1-${sdesat}*${ann}) + ${Ys}*${sdesat}*${ann}';
+                  P.expression2 = '$T[2]*(1-${sdesat}*${ann}) + ${Ys}*${sdesat}*${ann}';
+                  P.useSingleExpression = false;
+                  P.createNewImage = false; P.use64BitWorkingImage = true;
+                  P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+                  P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+                `);
+                log('  star-halo desat: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+              }
+              if (amount > 0) {
+                r = await pjsr(`
+                  var P = new PixelMath;
+                  P.expression = '$T*(1-${amount}*${ann})';
+                  P.useSingleExpression = true;
+                  P.createNewImage = false; P.use64BitWorkingImage = true;
+                  P.truncate = true; P.truncateLower = 0; P.truncateUpper = 1;
+                  P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+                `);
+                log('  star-halo dim: ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+              }
+            }
+          }
+        } else {
+          log('  WARN: could not open external stars — falling back to pipeline stars.');
+        }
+      } else {
+        log(`\n  WARN: star_add.starsFile not found: ${starAddP.starsFile} — falling back to pipeline stars.`);
+      }
+    }
+  }
   if (isEnabled('star_add') && starsId && !shouldSkip('star_add')) {
     await maybeCheckpoint('star_add');
     const starP = P('star_add');
@@ -4049,17 +4797,7 @@ async function run() {
   log('  ' + (r.outputs?.consoleOutput || r.error?.message || 'Done.'));
   log('  XISF: ' + outputPath);
 
-  // Save iteration-numbered JPG preview
-  if (iterNum) {
-    const iterJpg = `${outputDir}/iteration_${iterNum}.jpg`;
-    const previewJpg = path.join(PREVIEW_DIR, 'star_add.jpg');
-    try {
-      if (fs.existsSync(previewJpg)) {
-        fs.copyFileSync(previewJpg, iterJpg);
-        log(`  JPG preview: iteration_${iterNum}.jpg`);
-      }
-    } catch (e) { log('  WARN: Could not copy JPG preview: ' + e.message); }
-  }
+  // No separate raster preview: the iteration XISF above IS the preview (Dan: XISF only).
 
   const finalStats = await getStats(targetName);
   log('\n========================================');

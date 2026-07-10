@@ -64,4 +64,8 @@ Do this proactively — don't wait to be asked. The goal is that skills always r
 - No spaces in StarAlignment output paths
 - Close images aggressively to manage PixInsight memory
 - Do NOT use star erosion/threshold — creates artifacts. Non-linear extraction is clean.
-- GHS .dylib is not installed — use PixelMath fallback
+- GHS: the pipeline uses the native GeneralizedHyperbolicStretch process module when
+  installed (it is on the Windows box) and falls back to the PixelMath port otherwise
+  (macOS box lacks the module). `ghsCode()` emits a runtime branch handling both.
+- NO SetiAstro-derived code (star stretch, Statistical Stretch) — removed 2026-07-09 at
+  Dan's request; do not reintroduce. Star extraction is the non-linear SXT-unscreen method.

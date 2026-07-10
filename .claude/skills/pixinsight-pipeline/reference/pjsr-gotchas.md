@@ -27,6 +27,93 @@ searchDirectory(dir + '/*.json');       // glob-like listing
 
 **Do NOT use** `DataType_ByteArray` — it's not defined.
 
+### Windows path escaping when interpolating into PJSR strings
+Node builds paths with backslashes (`path.join` → `C:\Users\dan\...`). Interpolating one
+raw into a PJSR **string literal** eats the backslashes as JS escapes: `\U \d \p \c` collapse
+and every separator vanishes → `C:Usersdan.pixinsight-mcppreviewscombine_rgb.jpg`, which then
+fails with `Win32 error (5): Access is denied` (writing to a nonexistent parent). Two rules:
+- Prefer the **JSON bridge** (`send('open_image', ..., { filePath })`) — JSON escapes safely.
+- When you MUST interpolate a path into a `pjsr(\`...\`)` template, forward-slash it first:
+  `filePath.replace(/\\/g, '/')`. PixInsight accepts forward slashes on Windows. Escaping only
+  quotes (`.replace(/'/g, "\\'")`) is NOT enough — it leaves the backslashes to be eaten.
+Bit both `savePreview` and `saveCheckpoint` (2026-07-09). A failed `saveAs` also raised a
+**modal error dialog** that froze the resident watcher — recover by recycling the watcher
+instance (kill + relaunch), not by waiting on a click. See [[pjsr-resident-script-locks-ui]].
+
+### Exporting to PNG/JPEG — "insufficient numerical accuracy"
+Saving a 32-bit image (int or float) straight to PNG (≤16-bit) or JPEG (8-bit) makes
+PixInsight emit an **"insufficient numerical accuracy"** warning on every export (a modal
+dialog in GUI instances). The written pixels are converted correctly, but convert explicitly
+to silence it and make the depth intentional:
+```javascript
+tmp.setSampleFormat(16, false);   // on the export CLONE, never the working image
+tmp.saveAs(pngPath, false, false, false, false);
+```
+Also policy (Dan, 2026-07-10): **pipeline previews are XISF ONLY.** JPEG loses information
+(DCT artifacts masquerade as/hide grain, star profiles, chroma speckle) and even PNG raises
+format warnings on the Windows box — XISF is native, warning-free, full fidelity, viewed in
+PixInsight. `savePreview()` writes `<step>.xisf`. Raster exports (16-bit PNG with the
+`setSampleFormat` conversion above) are allowed only as ephemeral crops in a throwaway
+HEADLESS instance for automated visual checks — never through the watcher/GUI instance, and
+never as deliverables. Measure quantitative things (noise autocorrelation, medians) on the
+XISF itself, never an 8/16-bit export.
+
+## ABE Enum Names (PixInsight ≥1.9.4)
+`AutomaticBackgroundExtractor` prototype enums were renamed with prefixes; the old names
+return `undefined`, and assigning that throws "invalid argument type: unsigned integer
+value expected":
+
+| Old (broken) | Current |
+|---|---|
+| `prototype.f32` (model format) | `prototype.ModelFormat_f32` |
+| `prototype.SameAsTarget` | `prototype.CorrectedFormat_SameAsTarget` |
+| `prototype.Subtract` | `prototype.Correction_Subtract` |
+
+Probe pattern for any process enum rename: dump `Object.getOwnPropertyNames(Process.prototype)`
+filtered to numeric values in a throwaway headless instance (`probe-abe-enums.js` approach).
+
+**Related trap:** `toSource()` prints enums CLASS-level (`SpectrophotometricFluxCalibration.PSFType_Auto`)
+but they live on the PROTOTYPE — class-level access returns `undefined` and assignment throws
+"invalid argument type: unsigned integer value expected" (bit SPFC 2026-07-10). Always write
+`Process.prototype.EnumName` regardless of what toSource shows.
+
+**Same-name, different-units trap:** `BackgroundNeutralization.backgroundLow/High` are ABSOLUTE
+pixel bounds in [0,1] (defaults 0.0/0.1), while `SpectrophotometricColorCalibration.backgroundLow/High`
+are SIGMA values (defaults -2.8/+2.0). Copying SPCC's values into BN throws "numeric value out
+of range: -2.8" (bit the SPFC+BN step 2026-07-10).
+
+## Bridge command-file race (writer vs watcher poll)
+The watcher polls `bridge/commands/*.json` and can read a HALF-WRITTEN file (Win32 error 32
+sharing violation, or truncated JSON). It used to delete the file on parse failure — losing
+the command and stalling the sender's poll for the full 60-min timeout. Fixed 2026-07-10 on
+both ends; keep both invariants for any new bridge writer/reader:
+- **Writers write atomically**: write `<id>.json.tmp`, then rename to `<id>.json`
+  (`run-pipeline.mjs send()` does this; standalone .mjs helpers should too).
+- **The watcher retries** a failed parse on later polls and only drops a command file after
+  5 consecutive failures.
+
+## LRGBCombination Interface (PixInsight ≥1.9.4)
+The old per-channel properties (`channelL`, `channelR/G/B`, `lightness`, `saturation`) are
+GONE. Assigning them creates inert JS properties — the process silently runs with its
+DEFAULT channels table (all four enabled, empty ids), and empty ids auto-resolve to
+`<targetId>_R` etc. → "Source image not found: <target>_R", executeOn returns false.
+
+Current interface (from `(new LRGBCombination).toSource()`):
+```javascript
+P.channels = [        // [enabled, id, k] — row order R, G, B, L (L LAST; verified)
+   [false, "", 1.0],
+   [false, "", 1.0],
+   [false, "", 1.0],
+   [true, "L_work", 1.0]
+];
+P.mL = 0.5;           // was `lightness` (0.5 = neutral midtone)
+P.mc = 0.5;           // was `saturation`
+```
+Diagnostic that found the row order: fill L=0.6, RGB=0.25; L-last → mean≈0.57 (real
+lightness transfer); L-first → mean≈0.367 (=(0.6+0.25+0.25)/3, i.e. it replaced R).
+General probe pattern for ANY silently-failing process: print `P.toSource()` of a default
+instance — it shows the real parameter names and table shapes for the installed version.
+
 ## XISF Crop Masks
 XISF files from WBPP contain embedded crop masks. Opening creates MULTIPLE windows:
 ```javascript
@@ -63,6 +150,24 @@ Without these: "Cannot execute instance in the global context" error.
 - Code goes through JSON.stringify → JSON.parse → eval (beware escaping)
 - Single quotes in PJSR code work fine
 - Write long scripts to `/tmp/` files to avoid escaping issues
+
+## Process Parameter Names — snake_case vs camelCase (SILENT no-op trap)
+- PJSR process property names must match the module EXACTLY. Assigning an unknown
+  property (e.g. wrong case) does NOT error — it creates an ignored JS property and the
+  process runs at its **defaults**. This fails silently: the config value looks applied
+  but nothing changes.
+- **BlurXTerminator uses snake_case**: `sharpen_stars`, `sharpen_nonstellar`,
+  `adjust_halos`, `correct_only`, `correct_first`, `nonstellar_then_stellar`, `lum_only`,
+  `nonstellar_psf_diameter`, `auto_nonstellar_psf`, `ai_file`. The camelCase forms
+  (`sharpenStars`, `sharpenNonstellar`, `adjustStarHalos`, `correctOnly`) are **undefined**
+  and silently ignored → BXT ran at default 0.5/0.5 with `correct_only=false` for EVERY
+  iteration until fixed (2026-07-09). Symptom: changing a BXT value produced a
+  pixel-identical output (mean|diff| = 0.000000).
+- **Always verify a param took effect** when a value change should visibly matter: probe
+  `typeof P.someProp` (===\"undefined\" means wrong name), or diff two outputs. `for(k in new
+  BlurXTerminator)` dumps the real property names.
+- Suspect this whenever "raising X did nothing" — check the property name before assuming
+  the data is resolution-limited.
 
 ## Process Module Availability
 - Not all PI processes are installed as `.dylib` modules

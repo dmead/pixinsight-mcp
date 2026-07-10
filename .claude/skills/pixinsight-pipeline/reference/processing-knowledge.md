@@ -86,6 +86,32 @@
 - **LinearFit L to RGB luminance BEFORE combine** — without this, L's different background level creates a "veil" effect. Config: `linearFitRejectHigh: 0.92`
 - **Per-channel GC** (`perChannel: true`): apply BEFORE channel combination to equalize per-channel gradients
 
+### BXT Before SXT — On EVERY Branch (M81/M82 lesson, 2026-07-10)
+- SXT on aberrated/elongated PSFs leaves double-halo residuals in the starless image that
+  show through under re-added stars ("munged" stars — Dan's catch on M82 v3).
+- The main RGB branch had bxt_correct+bxt_sharpen before sxt, but the L and Ha branches
+  ran their SXT with NO prior BXT unless `l_bxt_correct`/`l_bxt_sharpen`/`ha_bxt_correct`
+  are explicitly enabled. **Enable them in every galaxy config.** The post-stretch `l_bxt`
+  should be disabled in favor of linear `l_bxt_sharpen` (BXT is designed for linear data).
+- **L stars are NOT used** (Dan, M82: "do not use the L stars for anything after blurx").
+  l_sxt discards its star image; final stars = RGB extraction only. A `star_lum_blend`
+  step exists (transfers stars_L lightness onto the RGB star layer via LRGBCombination)
+  but is OFF by default — only enable if explicitly asked.
+- **Star-stretch blackpoint = dark pixels, not statistics** (Dan): default `bpMethod:
+  'darkTile'` scans 256px tiles and uses the darkest tile's median. `median + k*sigma`
+  is biased upward by galaxy/nebula glow. Legacy behavior via `bpMethod:'sigma'`.
+- **Color calibration**: SPFC (`spfc` step, SpectrophotometricFluxCalibration — flux-scaled
+  channels from Gaia DR3/SP, no white reference) replaces SPCC for M82 per Dan. SPCC step
+  remains available for other targets. THREE hard-won SPFC facts (2026-07-10):
+  1. SPFC only MEASURES — it writes `PCL:SPFC:ScaleFactors` (Vector property) and leaves
+     pixels untouched ("success" with identical medians). The pipeline reads the property
+     and applies per-channel multipliers normalized to the max factor.
+  2. Flux scaling does NOT equalize the additive sky pedestal. A linked stretch after it
+     CLIPS THE LOW CHANNELS TO BLACK (first v6: R and G died entirely; image went B-only,
+     galaxy luminance survived only via LRGB combine). ALWAYS run linear
+     BackgroundNeutralization (dark-tile ROI) immediately after applying the factors.
+  3. `toSource()` prints enums class-level but they live on the prototype (see gotchas).
+
 ### Galaxy-Specific Settings
 - **SPCC**: `whiteReferenceName: "Average Spiral Galaxy"` — matches galaxy spectral profile
 - **Stretch targetBg**: 0.10 — standard for galaxies (darker than nebulae at 0.25)

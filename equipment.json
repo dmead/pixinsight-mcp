@@ -1,8 +1,19 @@
 {
-  "description": "Equipment configuration for SPCC color calibration. Edit to match YOUR setup.",
+  "description": "Equipment configuration for SPCC color calibration and reference. This file is documentation — copy the spcc block's values into each target config's spcc step params.",
+
+  "rig": {
+    "camera": "QHY533M (Sony IMX533 mono, 3.76um)",
+    "telescope": "TS-70 apo, 440mm f/6",
+    "plateScale": "1.76 arcsec/px native; 0.88 arcsec/px at drizzle 2x",
+    "filterWheel": "ZWO FilterWheel",
+    "filters_broadband": "Optolong LRGB",
+    "filters_narrowband": "Optolong SII / Ha / OIII",
+    "capture": "N.I.N.A.",
+    "site": "39.93N 75.38W (suburban)"
+  },
 
   "spcc": {
-    "filterSet": "Astronomik Deep Sky",
+    "filterSet": "Optolong LRGB",
     "sensorQE": "Sony IMX411/455/461/533/571",
     "whiteReference": "Average Spiral Galaxy",
 

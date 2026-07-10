@@ -95,6 +95,45 @@ that sends PJSR commands to PixInsight via file-based IPC (`~/.pixinsight-mcp/br
 **Non-linear star extraction** — Avoids halo bloating. Load pre-SXT checkpoint, apply identical
 stretch (HT+GHS), then SXT with `unscreen=true`. Screen blend to recombine: `~(~$T*~(strength*stars))`.
 
+**SHO palette workflow (validated on IC 443, 2026-07-09)** — Map files.R=SII, G=Ha, B=OIII,
+L=synthetic lum (0.55·Ha+0.30·SII+0.15·OIII, LinearFit SII/OIII→Ha first). Disable `spcc` and
+`scnr` (green IS Ha). New steps: `sho_palette` (greenTemper 0.45 pulls G toward (R+B)/2 —
+amber emerges on SII-dominant fronts via amberBoost, OIII teal is structurally protected;
+blueBoost lifts the rim), `bg_neutralize` (kills residual channel-offset background cast),
+`halo_suppress` (below). Stars come from a separate SPCC-calibrated broadband run:
+`star_stretch.saveStarsTo` exports, `star_add.starsFile` imports. Aux runs MUST use their own
+outputDir — a "vN" in any config name matches the iteration-number regex and will overwrite
+iteration_NN outputs.
+
+**Bright-star halo suppression (`halo_suppress`)** — SXT leaves scattered-light halos of
+bright stars in the starless image; the external star image re-deposits its own at blend.
+MEASURE first, then mask: find the true star center (brightest pixel in the star image) and
+the halo extent (radial profile — IC 443's Propus halo ran to ~900px at drizzle 2x). Use
+`shape: "butterworth"` (flat across the halo, sharp falloff; PixelMath `1/(1+exp(o*ln(d²/R²)))`)
+— a Gaussian narrower than the halo digs a pit and leaves a glowing rim. Star-side pass uses
+the same mask minus a core Gaussian; `coreSigma` must exceed the star's stretched PSF
+(~100px for a mag-3 star at 0.9"/px) or the star itself gets eaten. A wrong center (~200px)
+produces a lopsided hole — always measure, never eyeball from a preview.
+
+**BXT star-guard** — StarDetector count/medSize measured before/after `bxt_correct` and
+`bxt_sharpen` (default on; `starGuard: false` to disable), warns if >5% of stars vanish.
+Healthy BXT reads as count UP + size DOWN (PSF tightening resolves blends).
+
+**SPCC** — filter curves are loaded from PixInsight's `library/filters.xspd` by
+`spcc.filterSet` name ("Optolong LRGB" validated); unknown sets fall back to hardcoded
+Astronomik with a warning. Requires WCS: plate-solve the R master once via the watcher's
+embedded ImageSolver (seed ra/dec/resolution), then the `plate_solve` step copies it.
+Never run SCNR after SPCC.
+
+**Double-SXT nebulosity recovery (DEFAULT, all SXT steps)** — SXT misclassifies compact knots
+and filament crossings as stars and pulls surrounding nebulosity into the star image (severe on
+SNR filaments, e.g. IC 443). Fix: run SXT a second time ON the star image — its "starless" output
+is exactly the leaked nebulosity; PixelMath it back into the host (`$T + leak` linear, screen for
+unscreened) and keep the re-extracted clean stars. Controlled by `recoverNebulosity` (default
+true) on `sxt`, `ha_sxt`, `l_sxt`; in the non-linear star path the leak is only removed from the
+stars (host already recovered in the linear pass — adding it again would double-count).
+Per-step `*_leak` previews show what was recovered.
+
 **Ha injection (three-part with nebula mask):**
 1. Conditional R-channel: `R + strength * max(0, Ha - threshold*R)` — adds Ha where it exceeds existing R
 2. Luminance boost: LRGBCombination with Ha as luminance — transfers structural detail to all channels
@@ -169,11 +208,10 @@ Gives HDRMT working room in bright galaxy cores. L headroom=0.10, RGB headroom=0
 | Star sharpening | `bxt_sharpen.sharpenStars` | 0.1-0.5 | Subtle is better |
 | Nebula sharpening | `bxt_sharpen.sharpenNonstellar` | 0.3-0.75 | Can be more aggressive |
 | Halo reduction | `bxt_sharpen.adjustStarHalos` | -0.5 to 0 | 0.00 for galaxies (neg. causes ringing before SXT) |
-| Seti midtone | `star_stretch.setiMidtone` | 0.15-0.25 | Lower = more aggressive stretch per iteration |
-| Seti iterations | `star_stretch.setiIterations` | 3-7 | More = brighter faint stars |
-| Star saturation | `star_saturate.starSaturationCurve` | curve points | Must be aggressive — Seti stretch desaturates |
+| Star saturation | `star_saturate.starSaturationCurve` | curve points | Boosts extracted star color |
 | Star strength | `star_add.starStrength` | 1.0 | Use 1.0 with simple addition (screenBlend: false) |
 | Green removal | `scnr.amount` | 0.2-0.5 | 0.35 is a good default |
+| Nebulosity recovery | `sxt/ha_sxt/l_sxt.recoverNebulosity` | true/false | **Default true** — second SXT pass returns nebulosity SXT stole into the star image |
 
 ### Gradient Correction
 | What to adjust | Parameter | Range | Notes |
@@ -219,46 +257,62 @@ Gives HDRMT working room in bright galaxy cores. L headroom=0.10, RGB headroom=0
 - **Magenta/purple background**: SPCC issue — check sensor QE and filter profiles
 - **PixInsight crash**: Check memory (warn at 8GB). Close intermediate images aggressively.
 - **ImageSolver not defined**: Known — `#include` doesn't work in eval. SPCC still works without plate solve if image has WCS.
+- **Bright star renders as a blown/off-color ball in an RGB-stars-over-SHO composite** (e.g. a
+  mag-3 giant showing up blue/white instead of its true color): this is almost always a
+  **nebula-side artifact, not the star file**. SXT cannot fully remove a very bright star, so it
+  leaves a faint scatter-halo residual in the "starless" image; the aggressive nebula stretch then
+  amplifies that residual into a bright ball, and `sho_palette`/`bg_neutralize` can tint it (OIII→B
+  makes it blue). **Diagnose by measuring** the same region in the star file vs. the composite vs.
+  the SXT-output/checkpoint (annulus R/G/B means) — if the star file is the right color but the
+  composite isn't, it's the residual. **Fix** with the `halo_suppress` **nebula pass**
+  (`amount` pulls to local background, `desaturate` kills tint) positioned *after* `bg_neutralize`
+  and *before* `star_add`; keep the star-image pass (`starsAmount`/`starsDesaturate`) at 0 so the
+  good star is untouched. (IC443/Propus, 2026-07-09.)
+- **Suppressed halo leaves a lit disc (fills to a bright plateau) instead of fading out**: the
+  `halo_suppress` nebula pass fills toward the *local annulus* background, but around a very bright
+  star that annulus can clip nearby bright structure and read too high (Propus: 0.24 vs true dark
+  sky ~0.085). Set `pullTo: <dark-sky value>` (or `"black"`) on the halo to fill toward the true
+  floor so the glow fades. Measure the real dark sky at the star's row a few hundred px to the side
+  (not a full ring). Use amount ~0.95 and a `sigma` that covers the glow but not the naturally
+  brighter sky beyond it.
+- **Bright star has a green/teal core** in an RGB-stars composite (esp. after an aggressive
+  faint-lift star stretch, high GHS `b`): the green channel gets pushed up to meet the clipped red
+  at the saturated center. Fix with **SCNR green removal (AverageNeutral, preserveLightness)** on
+  the RGB star field — stars are never green, so it only clamps this artifact; real red/blue/white
+  stars are untouched. Do NOT SCNR the SHO composite (green = Ha there). (IC443/Propus, 2026-07-09.)
+- **Red/color noise in an SHO nebula** (speckle, esp. in SII-dominant amber regions — `amberBoost`
+  amplifies the low-SNR SII channel's noise along with its signal): use the `chroma_denoise` step
+  (PHASE 12z, before `star_add`). It extracts CIE **L\*a\*b\***, smooths **only a\*/b\*** (chroma),
+  and recombines with **L\* untouched** — so all structure/detail is preserved and only color
+  speckle goes. Runs before star-add so RGB star colors aren't bled. Characterize first (a\* is
+  usually HF-dominated = fine speckle; b\* carries more LF = blotches) and set `sigmaA`/`sigmaB`
+  accordingly (defaults 3.5 / 5.0). NB: MLT/MMT per-layer noise reduction did NOT engage in eval
+  (layer-format issue) — a direct Convolution on the smooth chroma channels is the robust operator.
+  This is luminance-protected color denoise; it does not replace NXT (which handles luminance).
+  (IC443, 2026-07-09.)
 
-## Star Method: Linear Seti Stretch (Recommended)
+## Star Method: Non-Linear Extraction (the only method)
 
-Inspired by [Seti Astro](https://www.setiastro.com) (Bill Blanshan). This is the recommended approach —
-produces tight, point-like stars without bloating.
+**SetiAstro-derived code (linear MTF star stretch, Statistical Stretch) was removed
+entirely on 2026-07-09 at Dan's request** (also CC BY-NC licensed). `starMethod: "linear"`
+and `stretchMethod: "seti"` in configs now log a warning and fall back.
 
-**How it works:**
-1. SXT on linear data (`stars=true`, no unscreen) — extract stars before stretch
-2. Clip background pedestal from linear star residuals
-3. Stretch with N iterations of the Midtone Transfer Function (MTF):
-   ```
-   MTF(m, x) = (1-m)*x / ((1-2m)*x + m)
-   ```
-4. Apply strong saturation boost (CurvesTransformation S channel) — the MTF stretch
-   desaturates stars, so aggressive saturation compensation is needed
-5. Add stars back with simple PixelMath addition at 100% strength (`screenBlend: false`)
+**How it works** (Phase 7b closes linear stars; Phase 8b extracts):
+1. SXT on linear main (`stars=true`, no unscreen); auto-checkpoint saves pre-SXT state
+2. Main image stretches (HT and/or GHS)
+3. Pre-SXT checkpoint is re-opened and given the IDENTICAL stretch
+4. SXT with `unscreen=true` on the stretched copy → display-range stars
+5. Star saturation curve, then `star_add` (addition or screen blend)
 
-**Config params:**
-```json
-"star_stretch": { "starMethod": "linear", "setiMidtone": 0.20, "setiIterations": 5 }
-"star_saturate": { "starSaturationCurve": [[0,0],[0.10,0.55],[0.30,0.80],[0.55,0.95],[1,1]] }
-"star_add": { "starStrength": 1.00, "screenBlend": false }
-```
-
-**Key lessons:**
-- `setiMidtone` 0.20 with 5 iterations is a good starting point
-- Star saturation must be applied AFTER the Seti stretch (stretch desaturates)
-- Use a very aggressive S-curve — linear stars have low inherent saturation
-- Simple addition at 1.00 strength works well (not screen blend)
-- Do NOT use star erosion/threshold — creates artifacts. Clean extraction is sufficient.
-
-**Alternative `"nonlinear"` method** (legacy, not recommended): loads pre-SXT checkpoint, applies
-identical HT+GHS stretch, then SXT with `unscreen=true`. Produces slightly bloated stars.
+Requires `stretch` enabled (defines the HT that 8b replays) and the sxt checkpoint.
+For a stars-only export run: enable through `stretch` with `ghsPasses: []` and set
+`star_stretch.saveStarsTo`. Do NOT use star erosion/threshold — creates artifacts.
 
 ## Credits / Inspired By
 
 | Technique | Source |
 |-----------|--------|
-| Star Stretch (Seti/MTF method) | [Seti Astro](https://www.setiastro.com) — Bill Blanshan |
-| Generalized Hyperbolic Stretch | [GHS Script](https://ghsastro.co.uk) — Mike Cranfield & Mark Shelley. PI script at `src/scripts/GeneralisedHyperbolicStretch/` |
+| Generalized Hyperbolic Stretch | [GHS](https://ghsastro.co.uk) — Mike Cranfield & Mark Shelley. Native process module used when installed; PixelMath port as fallback |
 | Non-linear star extraction | PixInsight community technique |
 | Screen blend recombination | Standard astrophotography: `1-(1-A)*(1-B)` |
 | STF Auto-stretch | PixInsight built-in STF algorithm |
@@ -314,3 +368,4 @@ Update the diagram when the pipeline structure changes (new steps added/removed,
 - [Xterminator Tools](reference/xterminator-tools.md) — SXT, NXT, BXT parameter reference
 - [GHS Stretch](reference/ghs-stretch.md) — GHS formula, PixelMath implementation, multi-pass strategy
 - [Processing Knowledge](reference/processing-knowledge.md) — Equipment settings, quality assessment, lessons learned
+- [WBPP Stacking & Drizzle](reference/wbpp-stacking.md) — Headless WBPP automation, drizzle via pipeline builder script, drop shrink optimization (dmead/drizzleoptimizer)
