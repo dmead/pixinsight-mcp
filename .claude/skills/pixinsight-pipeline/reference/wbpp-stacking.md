@@ -53,6 +53,20 @@ Low-weight subs are dropped automatically by `minWeight` (default 0.05 normalize
 Signal Weight) — on IC 443 this cut 26/141 Ha + 3/156 OIII cloudy subs. Intentional; check
 the "(N active)" counts in the log.
 
+### Dan's canonical Image Integration settings (GUI reference, 2026-07-11)
+Match these in every automation stack (his GUI screenshot is authoritative):
+```
+combination Average (default), minWeight=0.05,
+rejection_4=3 (Generalized ESD — EXPLICIT; "Auto" picks linear-fit on big groups and
+  linear-fit leaks dither-gap hot pixels), ESD_Outliers_4=0.10 (NOT the 0.30 PI default),
+ESD_Significance_4=0.05,
+lightsLargeScaleRejectionHigh=true (layers 2, growth 2),
+lightsLargeScaleRejectionLow=true  (layers 2, growth 2)   <- BOTH high AND low
+```
+Also standard for this workflow: CosmeticCorrection (auto 3σ) on the calibrated subs
+BEFORE stacking — per-pixel rejection cannot catch hot pixels that repeat at the same sky
+position through dither gaps.
+
 ## Traps
 
 1. **Auto FastIntegration ≥150 frames.** `autoIntegrationMode` defaults to true: any

@@ -135,6 +135,10 @@ for (var i = 0; i < wins.length; i++) {
 Without these: "Cannot execute instance in the global context" error.
 
 ## PixelMath Limitations
+- **CIEL()/color-space functions in a single expression on an RGB target COLLAPSE the
+  image to luminance** (all three channels come out identical — bit the IFN blend
+  2026-07-10). Build masks needing CIEL as a separate GRAYSCALE image first, then keep
+  the RGB expression purely scalar ($T, image refs, mask refs).
 - **No `pow()` function** — use `exp(exponent * ln(base))` instead
 - **`^` operator** works for fractional/negative exponents
 - Negative numbers must be wrapped: `(-1.859)` not `-1.859` in some contexts
