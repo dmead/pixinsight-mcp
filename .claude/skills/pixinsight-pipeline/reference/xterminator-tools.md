@@ -91,11 +91,23 @@ P.executeOn(starlessView);
 
 ## NoiseXTerminator (NXT)
 
-### Parameters
+### Parameters (NXT 3 — verified by process introspection 2026-07-11)
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `denoise` | float | 0.70 | Denoising strength (0-1) |
+| `denoise` | float | 0.90 | Denoise strength; HIGH-frequency band when separation is on |
+| `denoise_color` | float | 0.90 | Chroma denoise (HF band) |
+| `denoise_lf` | float | 0.90 | LOW-frequency denoise (needs `enable_frequency_separation`) |
+| `denoise_lf_color` | float | 0.90 | LF chroma denoise |
+| `enable_frequency_separation` | bool | false | Split LF/HF bands (classic single-band otherwise) |
+| `frequency_scale` | float | 5 | LF/HF crossover scale |
+| `iterations` | int | 2 | Denoise iterations |
 | `detail` | float | 0.15 | Detail preservation (0-1) |
+
+**Detail-recovery shape (Dan):** strong LF (kills blotch) + restrained HF (keeps
+grain-scale real structure for BXT): e.g. HF 0.30-0.35 / LF 0.55-0.65 / detail 0.20.
+A flat single-band `denoise` raise trades both bands at once and eats detail.
+Pipeline config keys: `frequencySeparation`, `denoiseLf`, `denoiseLfColor`,
+`frequencyScale`, `denoiseColor` on any nxt_* step (helper `nxtLF()`).
 
 ### Recommended Strategy: Multiple Light Passes
 Prefer multiple gentle applications over fewer heavy ones. Over-denoising causes:

@@ -406,6 +406,14 @@ async function cloneImage(sourceId, cloneId) {
   if (r.status === 'error') throw new Error('cloneImage: ' + r.error.message);
 }
 
+// NXT 3 frequency separation: optional LF/color assignments appended to the
+// classic denoise/detail pair. Config keys: frequencySeparation (bool),
+// denoiseLf, denoiseLfColor, frequencyScale, denoiseColor. With
+// frequencySeparation on, `denoise` becomes the HIGH-frequency strength.
+const nxtLF = p => ((p?.frequencySeparation
+  ? ` P.enable_frequency_separation=true; P.denoise_lf=${p.denoiseLf ?? 0.6}; P.denoise_lf_color=${p.denoiseLfColor ?? p.denoiseLf ?? 0.6}; P.frequency_scale=${p.frequencyScale ?? 5};`
+  : '') + (p?.denoiseColor != null ? ` P.denoise_color=${p.denoiseColor};` : ''));
+
 // Restore target from a clone (in-memory copy)
 async function restoreFromClone(targetId, cloneId) {
   const r = await pjsr(`
@@ -2113,7 +2121,7 @@ async function run() {
     const nxtP = P('nxt_pass1');
     log('\n==== PHASE 6: NXT pass 1 ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.30}; P.detail=${nxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.30}; P.detail=${nxtP.detail ?? 0.15};${nxtLF(nxtP)}
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2370,7 +2378,7 @@ async function run() {
     const haNxtLP = P('ha_nxt_linear');
     log(`\n==== PHASE 7c3: Ha NXT linear (denoise=${haNxtLP.denoise ?? 0.30}, detail=${haNxtLP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtLP.denoise ?? 0.30}; P.detail=${haNxtLP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtLP.denoise ?? 0.30}; P.detail=${haNxtLP.detail ?? 0.15};${nxtLF(haNxtLP)}
       P.executeOn(ImageWindow.windowById('Ha_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2451,7 +2459,7 @@ async function run() {
     const haNxtP = P('ha_nxt');
     log(`\n==== PHASE 7e1: Ha NXT (denoise=${haNxtP.denoise ?? 0.50}, detail=${haNxtP.detail ?? 0.15}) ====`);
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtP.denoise ?? 0.50}; P.detail=${haNxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${haNxtP.denoise ?? 0.50}; P.detail=${haNxtP.detail ?? 0.15};${nxtLF(haNxtP)}
       P.executeOn(ImageWindow.windowById('Ha_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2482,7 +2490,7 @@ async function run() {
     log(`\n==== PHASE 7d3: L NXT LINEAR (denoise=${lNxtLP.denoise ?? 0.25}, detail=${lNxtLP.detail ?? 0.15}) ====`);
     r = await pjsr(`
       var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
-      P.denoise = ${lNxtLP.denoise ?? 0.25}; P.detail = ${lNxtLP.detail ?? 0.15};
+      P.denoise = ${lNxtLP.denoise ?? 0.25}; P.detail = ${lNxtLP.detail ?? 0.15};${nxtLF(lNxtLP)}
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2727,7 +2735,7 @@ async function run() {
     const lNxtP = P('l_nxt');
     log('\n==== PHASE 7g: L NXT ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${lNxtP.denoise ?? 0.50}; P.detail=${lNxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${lNxtP.denoise ?? 0.50}; P.detail=${lNxtP.detail ?? 0.15};${nxtLF(lNxtP)}
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -2839,7 +2847,7 @@ async function run() {
     r = await pjsr(`
       var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
       P.denoise = ${lNxtFP.denoise ?? 0.30};
-      P.detail = ${lNxtFP.detail ?? 0.15};
+      P.detail = ${lNxtFP.detail ?? 0.15};${nxtLF(lNxtFP)}
       P.executeOn(ImageWindow.windowById('L_work').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -3111,11 +3119,18 @@ async function run() {
               var Wr  = 'min(1,max(0,('+SMr+' - ${cs})/${cr}))';
               var Wch = 'min(1,max(0,(0.25 - '+MNr+'/max('+SMr+',0.00001))/0.10))*min(1,max(0,('+SMr+' - 0.25)/0.10))';
               var W = 'max('+Wb+',max('+Wr+','+Wch+'))';
+              // SPLIT GATES (v23): W above is the HUE gate only. The smoothed
+              // brightness profile is a separate HIGH gate — σ2 smoothing crushes
+              // small-star peaks (dark cores), smears noise specks into donut
+              // rings, and flattens big-star falloff into annuli when applied
+              // frame-wide. Only checkered saturated plateaus need it.
+              var Wl = 'min(1,max(0,('+SM+' - 0.55)/0.15))';
+              var B  = '((1-'+Wl+')*'+SMr+' + '+Wl+'*'+SM+')';
               var PM = new PixelMath;
               PM.useSingleExpression = false;
-              PM.expression  = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[0]/max('+LM+',0.00001)';
-              PM.expression1 = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[1]/max('+LM+',0.00001)';
-              PM.expression2 = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[2]/max('+LM+',0.00001)';
+              PM.expression  = '(1-'+W+')*$T + '+W+'*'+B+'*stretched_ref_core[0]/max('+LM+',0.00001)';
+              PM.expression1 = '(1-'+W+')*$T + '+W+'*'+B+'*stretched_ref_core[1]/max('+LM+',0.00001)';
+              PM.expression2 = '(1-'+W+')*$T + '+W+'*'+B+'*stretched_ref_core[2]/max('+LM+',0.00001)';
               PM.createNewImage = false; PM.use64BitWorkingImage = true;
               PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
               PM.executeOn(sv);
@@ -3237,7 +3252,7 @@ async function run() {
     const nxtP = P('nxt_pass2');
     log('\n==== PHASE 9: NXT pass 2 ====');
     r = await pjsr(`
-      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.60}; P.detail=${nxtP.detail ?? 0.15};
+      var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb'; P.denoise=${nxtP.denoise ?? 0.60}; P.detail=${nxtP.detail ?? 0.15};${nxtLF(nxtP)}
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
@@ -4313,7 +4328,7 @@ async function run() {
     log(`\n==== PHASE 11i: NXT FINAL (denoise=${nxtFDenoise}, detail=${nxtFDetail}) ====`);
     r = await pjsr(`
       var P = new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
-      P.denoise = ${nxtFDenoise}; P.detail = ${nxtFDetail};
+      P.denoise = ${nxtFDenoise}; P.detail = ${nxtFDetail};${nxtLF(nxtFP)}
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
     log('  ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
