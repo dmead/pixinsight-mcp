@@ -67,6 +67,20 @@ Avoids halo bloating from stretching linear stars:
 5. Run SXT with `unscreen=true` on stretched pre-SXT image
 6. Result: display-range stars compatible with screen blend
 
+### SXT Unscreen Corrupts Saturated Cores on Bright Backgrounds (2026-07-11)
+On a bright star superposed on a galaxy disk (M81, star at ~144 px from the core),
+SXT unscreen extraction INVERTED the core color: a blue-white star (linear B/G ≈ 1.8)
+came out with G ≈ 0.86, B ≈ 0.02, with checkered pixel-to-pixel chroma noise (this
+was the "drizzle grid on green stars" complaint — the grid was never in the stacks).
+Mechanism: SXT hallucinates part of the star's flux into the starless prediction
+per-channel; the channel where the starless comes out nearly as bright as the
+star-ful image gets `star ≈ 0` after unscreen. Fixing the masters cannot cure it.
+**Fix (in pipeline Phase 8b):** clone the stretched pre-SXT image (`stretched_ref_core`)
+before SXT; after extraction + hygiene, re-impose its hue on bright star-layer pixels
+(smoothstep gate on star-layer max channel, `coreRepairStart` 0.45 / `coreRepairRamp`
+0.20, ref smoothed σ=2), keeping the layer's own brightness profile. Near-identity
+for honest stars. Config: `star_stretch.coreColorRepair` (default true).
+
 ### Screen Blend Recombination
 ```javascript
 // PixelMath screen blend: ~(~starless * ~(strength * stars))

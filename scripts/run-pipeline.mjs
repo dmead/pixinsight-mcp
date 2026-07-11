@@ -2996,6 +2996,13 @@ async function run() {
           log('    ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
         }
 
+        // Keep the stretched star-ful image: SXT unscreen mangles the color of
+        // saturated cores over bright backgrounds (observed: blue-white star on
+        // M81's disk extracted as G=0.86/B=0.02 with checkered chroma). This
+        // reference carries the honest core hue for the repair step below.
+        // Must be cloned BEFORE beforeSxt2 so it isn't detected as the star image.
+        await cloneImage(tempId, 'stretched_ref_core');
+
         // SXT with unscreen on the stretched image
         log('  SXT with unscreen...');
         let beforeSxt2 = (await listImages()).map(i => i.id);
@@ -3064,6 +3071,60 @@ async function run() {
             log('  Star layer NXT ' + layerDenoise + ': ' + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
           }
 
+          // Core color repair (v19): where the star layer is bright, SXT-unscreen
+          // hue is unreliable — re-impose the hue of the stretched pre-SXT image
+          // (slightly smoothed), keeping the layer's own brightness profile.
+          // Near-identity for honestly-extracted stars; runs before saturation so
+          // the boost amplifies the corrected hue.
+          if (sxtP3.coreColorRepair ?? true) {
+            // Low gate by design: unscreen supplies the brightness profile, the
+            // pre-SXT reference supplies the hue, for everything above the noise
+            // floor. Green fringes/halos live at layer values 0.2-0.4 — a "cores
+            // only" gate leaves them tinted.
+            const cs = sxtP3.coreRepairStart ?? 0.10;
+            const cr = sxtP3.coreRepairRamp ?? 0.15;
+            r = await pjsr(`
+              var ref = ImageWindow.windowById('stretched_ref_core');
+              if (ref.isNull) throw new Error('stretched_ref_core missing');
+              var C = new Convolution; C.mode = Convolution.prototype.Parametric; C.sigma = 2.0;
+              C.executeOn(ref.mainView);
+              // Smoothed copy of the star layer: unscreen leaves a checkered
+              // LUMINANCE pattern in saturated cores too, so the brightness
+              // profile must come from a smoothed layer, not the raw one.
+              var sv = ImageWindow.windowById('${starsId}').mainView;
+              var PMc = new PixelMath; PMc.expression = '$T'; PMc.useSingleExpression = true;
+              PMc.createNewImage = true; PMc.showNewImage = false;
+              PMc.newImageId = 'stars_smooth_core';
+              PMc.newImageColorSpace = PixelMath.prototype.SameAsTarget;
+              PMc.executeOn(sv);
+              C.executeOn(ImageWindow.windowById('stars_smooth_core').mainView);
+              var SM = 'max(stars_smooth_core[0],max(stars_smooth_core[1],stars_smooth_core[2]))';
+              var LM = 'max(stretched_ref_core[0],max(stretched_ref_core[1],stretched_ref_core[2]))';
+              // Gate on smoothed OR raw brightness (few-px specks vanish under the
+              // blur), OR unphysical chroma: a channel < 25% of the pixel's max is
+              // impossible for a real star and marks unscreen junk regardless of
+              // brightness. Replacement hue is the star's own pre-SXT hue, so an
+              // honest star triggering any gate is a no-op.
+              var SMr = 'max($T[0],max($T[1],$T[2]))';
+              var MNr = 'min($T[0],min($T[1],$T[2]))';
+              var Wb  = 'min(1,max(0,('+SM+' - ${cs})/${cr}))';
+              var Wr  = 'min(1,max(0,('+SMr+' - ${cs})/${cr}))';
+              var Wch = 'min(1,max(0,(0.25 - '+MNr+'/max('+SMr+',0.00001))/0.10))*min(1,max(0,('+SMr+' - 0.25)/0.10))';
+              var W = 'max('+Wb+',max('+Wr+','+Wch+'))';
+              var PM = new PixelMath;
+              PM.useSingleExpression = false;
+              PM.expression  = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[0]/max('+LM+',0.00001)';
+              PM.expression1 = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[1]/max('+LM+',0.00001)';
+              PM.expression2 = '(1-'+W+')*$T + '+W+'*'+SM+'*stretched_ref_core[2]/max('+LM+',0.00001)';
+              PM.createNewImage = false; PM.use64BitWorkingImage = true;
+              PM.truncate = true; PM.truncateLower = 0; PM.truncateUpper = 1;
+              PM.executeOn(sv);
+              var wsc = ImageWindow.windowById('stars_smooth_core'); if(!wsc.isNull) wsc.forceClose();
+              'core color repair applied (start=${cs}, ramp=${cr}, smoothed profile)';
+            `);
+            log('  ' + (r.status === 'error' ? 'WARN core repair: ' + r.error.message : (r.outputs?.consoleOutput?.trim() || 'core repair done')));
+          }
+
           // Star saturation
           if (isEnabled('star_saturate')) {
             const starP2 = P('star_saturate');
@@ -3080,6 +3141,7 @@ async function run() {
         } else {
           log('  WARNING: No star image from SXT unscreen.');
         }
+        await pjsr(`var w=ImageWindow.windowById('stretched_ref_core');if(!w.isNull)w.forceClose();`);
       } else {
         log('  WARN: Could not open checkpoint: ' + (openR2.error?.message || 'unknown'));
       }

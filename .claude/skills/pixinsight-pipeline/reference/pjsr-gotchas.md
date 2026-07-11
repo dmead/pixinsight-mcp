@@ -27,6 +27,13 @@ searchDirectory(dir + '/*.json');       // glob-like listing
 
 **Do NOT use** `DataType_ByteArray` — it's not defined.
 
+## Image.sample() ignores selectedChannel
+`img.selectedChannel = c; img.sample(x, y)` does NOT read channel c — it silently reads
+channel 0 every time, so per-channel probes come back identical across R/G/B (bit a
+green-core scanner AND a phase-bisect probe on 2026-07-11 before being caught). Pass the
+channel explicitly: `img.sample(x, y, c)`. `selectedRect` + statistics (`img.median()`)
+DO honor selections; it's point sampling that doesn't.
+
 ### Windows path escaping when interpolating into PJSR strings
 Node builds paths with backslashes (`path.join` → `C:\Users\dan\...`). Interpolating one
 raw into a PJSR **string literal** eats the backslashes as JS escapes: `\U \d \p \c` collapse
