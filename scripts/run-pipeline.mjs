@@ -3151,6 +3151,25 @@ async function run() {
             log('  Star saturation applied.');
           }
 
+          // Star-layer channel balance (critique #1): stars are screen-added
+          // AFTER curves_final, so they never receive the galaxy's G/B
+          // correction and keep the blue-deficient SPCC balance (olive halos).
+          // A mild flat boost preserves relative hue ordering (orange stays
+          // orange) while removing the shared lean. Config:
+          // star_stretch.starChannelBoost {R,G,B}.
+          const scb = sxtP3.starChannelBoost;
+          if (scb) {
+            const sbR = scb.R ?? 1.0, sbG = scb.G ?? 1.0, sbB = scb.B ?? 1.0;
+            r = await pjsr(`
+              var P=new PixelMath;
+              P.expression='$T*${sbR}'; P.expression1='$T*${sbG}'; P.expression2='$T*${sbB}';
+              P.useSingleExpression=false; P.createNewImage=false;
+              P.use64BitWorkingImage=true; P.truncate=true; P.truncateLower=0; P.truncateUpper=1;
+              P.executeOn(ImageWindow.windowById('${starsId}').mainView);
+            `);
+            log(`  Star layer channel balance R×${sbR} G×${sbG} B×${sbB}: ` + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+          }
+
           await savePreview(starsId, 'star_stretch');
           await maybeSaveStars(starsId);
         } else {
@@ -4351,14 +4370,58 @@ async function run() {
       P.S=${curveToPJSR(curP.saturationCurve || [[0,0],[0.45,0.52],[1,1]])};
       P.executeOn(ImageWindow.windowById('${targetName}').mainView);
     `);
-    // Per-channel boost (e.g., blue boost for pink/magenta tones)
+    // Per-channel boost (e.g., blue boost for pink/magenta tones).
+    // Optionally luminance-gated (channelBoostGate: {start, ramp}): a flat
+    // multiplier over-rotates dim halo hue (a G-lean of a few milli-units flips
+    // to red-magenta rim after G x0.85) while sky below the bg_neutralize
+    // threshold gets re-anchored — the gate fades the boost to identity in dim
+    // regions so only tones that carry real color get corrected.
     const chanBoost = curP.channelBoost;
     if (chanBoost) {
       const bR = chanBoost.R ?? 1.0, bG = chanBoost.G ?? 1.0, bB = chanBoost.B ?? 1.0;
-      log(`  Channel boost: R×${bR} G×${bG} B×${bB}...`);
+      const gate = curP.channelBoostGate;
+      if (gate) {
+        const gs = gate.start ?? 0.08, gr = gate.ramp ?? 0.20;
+        log(`  Channel boost: R×${bR} G×${bG} B×${bB} (luminance-gated ${gs}/${gr})...`);
+        await pjsr(`
+          var W = 'min(1,max(0,((($T[0]+$T[1]+$T[2])/3) - ${gs})/${gr}))';
+          var P=new PixelMath;
+          P.expression ='$T*(1 + (${bR}-1)*'+W+')';
+          P.expression1='$T*(1 + (${bG}-1)*'+W+')';
+          P.expression2='$T*(1 + (${bB}-1)*'+W+')';
+          P.useSingleExpression=false; P.createNewImage=false;
+          P.use64BitWorkingImage=true; P.truncate=true; P.truncateLower=0; P.truncateUpper=1;
+          P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+        `);
+      } else {
+        log(`  Channel boost: R×${bR} G×${bG} B×${bB}...`);
+        await pjsr(`
+          var P=new PixelMath;
+          P.expression='$T*${bR}'; P.expression1='$T*${bG}'; P.expression2='$T*${bB}';
+          P.useSingleExpression=false; P.createNewImage=false;
+          P.use64BitWorkingImage=true; P.truncate=true; P.truncateLower=0; P.truncateUpper=1;
+          P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+        `);
+      }
+    }
+    // Dim-zone chroma temper: where the luminance gate faded the channel boost
+    // out, the native G-over-B lean (olive) survives. Desaturate toward the
+    // pixel's own luminance, weighted by (1-gate): self-limiting on ALL axes
+    // (a G->B transfer variant lowered G and flipped R≈G>B olive into RED rims,
+    // and leached mid-tone gold — v29). Bright regions (gate=1) untouched.
+    // Config: curves_final.dimChromaTemper {k, start, ramp}.
+    const dct = curP.dimChromaTemper;
+    if (dct) {
+      const dk = dct.k ?? 0.6, ds = dct.start ?? 0.15, dr = dct.ramp ?? 0.15;
+      log(`  Dim-zone chroma desaturation: k=${dk} gate ${ds}/${dr}...`);
       await pjsr(`
+        var LM = '(($T[0]+$T[1]+$T[2])/3)';
+        var W = 'min(1,max(0,('+LM+' - ${ds})/${dr}))';
+        var K = '(${dk}*(1-'+W+'))';
         var P=new PixelMath;
-        P.expression='$T*${bR}'; P.expression1='$T*${bG}'; P.expression2='$T*${bB}';
+        P.expression ='$T + '+K+'*('+LM+' - $T)';
+        P.expression1='$T + '+K+'*('+LM+' - $T)';
+        P.expression2='$T + '+K+'*('+LM+' - $T)';
         P.useSingleExpression=false; P.createNewImage=false;
         P.use64BitWorkingImage=true; P.truncate=true; P.truncateLower=0; P.truncateUpper=1;
         P.executeOn(ImageWindow.windowById('${targetName}').mainView);
