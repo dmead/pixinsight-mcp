@@ -4937,6 +4937,104 @@ async function run() {
   log('  ' + (r.outputs?.consoleOutput || r.error?.message || 'Done.'));
   log('  XISF: ' + outputPath);
 
+  // ==== PHASE 14b: GHS FINISH (IFN reveal render — Dan's recipe, 2026-07-12) ====
+  // Produces iteration_NN_ghs.xisf alongside the house-dark deliverable:
+  // top-crop -> NXT (freq-split, BEFORE the stretch) -> GHS anchored at sky ->
+  // linear BP re-anchor -> gold rotate (inter-arm khaki) -> highlight chroma pop.
+  if (isEnabled('ghs_finish') && !shouldSkip('ghs_finish')) {
+    const gf = P('ghs_finish');
+    log('\n==== PHASE 14b: GHS FINISH ====');
+    const topCrop = gf.topCrop ?? 0;
+    if (topCrop > 0) {
+      await pjsr(`
+        var C=new Crop; C.mode=Crop.prototype.AbsolutePixels;
+        C.leftMargin=0; C.rightMargin=0; C.topMargin=-${topCrop}; C.bottomMargin=0;
+        C.executeOn(ImageWindow.windowById('${targetName}').mainView);
+      `);
+      log(`  Top crop ${topCrop}px (stack coverage band).`);
+    }
+    const gn = gf.nxt || {};
+    r = await pjsr(`
+      var P=new NoiseXTerminator; P.ai_file='NoiseXTerminator.3.pb';
+      P.enable_frequency_separation=true; P.frequency_scale=${gn.frequencyScale ?? 8};
+      P.denoise=${gn.denoise ?? 0.60}; P.denoise_lf=${gn.denoiseLf ?? 0.35};
+      P.denoise_color=${gn.denoiseColor ?? 0.85}; P.denoise_lf_color=${gn.denoiseLfColor ?? 0.50};
+      P.detail=${gn.detail ?? 0.15};
+      var ok=P.executeOn(ImageWindow.windowById('${targetName}').mainView);
+      ok ? 'NXT ok' : 'NXT FAILED (unlicensed slot?)';
+    `);
+    log('  ' + (r.outputs?.consoleOutput?.trim() || 'NXT done'));
+    const st14b = await getStats(targetName);
+    const g = gf.ghs || {};
+    r = await pjsr(ghsCode(targetName, g.D ?? 3.36, g.b ?? -1.8, st14b.median, g.LP ?? 0, g.HP ?? 0.89));
+    log(`  GHS reveal (D=${g.D ?? 3.36}, b=${g.b ?? -1.8}, SP=${st14b.median.toFixed(5)}): ` + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    const tbg = gf.targetBg ?? 0.10;
+    r = await pjsr(`
+      function darkTileMedian(img,T){ var best=1;
+        for (var y=0;y<img.height;y+=T) for (var x=0;x<img.width;x+=T){
+          img.selectedRect=new Rect(x,y,Math.min(x+T,img.width),Math.min(y+T,img.height));
+          var m=img.median(); if(m<best) best=m; }
+        img.resetSelections(); return best; }
+      var v=ImageWindow.windowById('${targetName}').mainView;
+      var sky=darkTileMedian(v.image,256);
+      if (sky > ${tbg}) {
+        var bp=(sky - ${tbg})/(1 - ${tbg});
+        var PM=new PixelMath;
+        PM.expression='($T - '+bp+')/(1 - '+bp+')';
+        PM.useSingleExpression=true; PM.createNewImage=false;
+        PM.use64BitWorkingImage=true; PM.truncate=true; PM.truncateLower=0; PM.truncateUpper=1;
+        PM.executeOn(v);
+        'BP re-anchor ' + bp.toFixed(5);
+      } else 'BP skip (sky ' + sky.toFixed(4) + ')';
+    `);
+    log('  ' + (r.outputs?.consoleOutput?.trim() || 'BP done'));
+    const gr = gf.goldRotate || {};
+    if (gr.k !== 0) {
+      const gk = gr.k ?? 0.5, gls = gr.lumStart ?? 0.25, glr = gr.lumRamp ?? 0.10, ggb = gr.gbRamp ?? 0.03;
+      r = await pjsr(`
+        var LM='(($T[0]+$T[1]+$T[2])/3)';
+        var WL='min(1,max(0,('+LM+' - ${gls})/${glr}))';
+        var WG='min(1,max(0,($T[1]-$T[2])/${ggb}))';
+        var X='(${gk}*($T[1]-$T[2])*'+WL+'*'+WG+')';
+        var PM=new PixelMath; PM.useSingleExpression=false;
+        PM.expression='$T + 0.3*'+X; PM.expression1='$T - 0.7*'+X; PM.expression2='$T + 0.4*'+X;
+        PM.createNewImage=false; PM.use64BitWorkingImage=true;
+        PM.truncate=true; PM.truncateLower=0; PM.truncateUpper=1;
+        PM.executeOn(ImageWindow.windowById('${targetName}').mainView);
+      `);
+      log(`  Gold rotate (k=${gk}): ` + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    }
+    const cp = gf.chromaPop || {};
+    if (cp.k !== 0) {
+      const pk = cp.k ?? 0.5, ps = cp.start ?? 0.30, pr = cp.ramp ?? 0.15;
+      r = await pjsr(`
+        var LM='(($T[0]+$T[1]+$T[2])/3)';
+        var W='min(1,max(0,('+LM+' - ${ps})/${pr}))';
+        var F='(1 + ${pk}*'+W+')';
+        var PM=new PixelMath; PM.useSingleExpression=false;
+        PM.expression =LM+' + ($T - '+LM+')*'+F;
+        PM.expression1=LM+' + ($T - '+LM+')*'+F;
+        PM.expression2=LM+' + ($T - '+LM+')*'+F;
+        PM.createNewImage=false; PM.use64BitWorkingImage=true;
+        PM.truncate=true; PM.truncateLower=0; PM.truncateUpper=1;
+        PM.executeOn(ImageWindow.windowById('${targetName}').mainView);
+      `);
+      log(`  Highlight chroma pop (k=${pk}): ` + (r.status === 'error' ? 'WARN: ' + r.error.message : 'Done.'));
+    }
+    const ghsPath = iterNum
+      ? `${outputDir}/iteration_${iterNum}_ghs.xisf`
+      : `${outputDir}/${targetName}${suffix}_ghs.xisf`;
+    r = await pjsr(`
+      var p='${esc(ghsPath)}';
+      if(File.exists(p)) File.remove(p);
+      ImageWindow.windowById('${targetName}').saveAs(p,false,false,false,false);
+      'saved';
+    `);
+    log('  GHS XISF: ' + ghsPath);
+  } else if (!isEnabled('ghs_finish')) {
+    log('\n==== PHASE 14b: GHS FINISH (SKIPPED) ====');
+  }
+
   // No separate raster preview: the iteration XISF above IS the preview (Dan: XISF only).
 
   const finalStats = await getStats(targetName);
