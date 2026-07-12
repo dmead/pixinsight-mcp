@@ -27,6 +27,22 @@ searchDirectory(dir + '/*.json');       // glob-like listing
 
 **Do NOT use** `DataType_ByteArray` — it's not defined.
 
+## XTerminator executeOn() returns false SILENTLY in fresh instances (LICENSE)
+All three RC-Astro tools (NXT/BXT/SXT) return `executeOn() === false` — no exception,
+no dialog — in freshly launched headless PixInsight instances while the SAME call works
+in the watcher (verified 2026-07-12: watcher NXT true, fresh-instance NXT/BXT/SXT all
+false). ROOT CAUSE (Dan): **the RC-Astro license key lives in per-instance-slot
+settings** (same namespace as the swap-directory setting, see [[c-drive-full-swap-on-d]]
+behavior). `-n` instances land on the next free slot; slots beyond the ones Dan has
+licensed have no key, and automation mode suppresses the license dialog → silent false.
+Which slot you get depends on how many instances are open — that's why headless XT
+worked some days (low slot, licensed) and not others. Rules:
+- Route ad-hoc XT work through the WATCHER via the bridge (idle only).
+- ALWAYS verify effect (stddev before/after) when running XT outside the watcher.
+- In new code, check `executeOn()`'s return value and log/fail on false.
+- Durable fix: launch spare instances interactively and enter the license in a few
+  more slots (Dan).
+
 ## Image.sample() ignores selectedChannel
 `img.selectedChannel = c; img.sample(x, y)` does NOT read channel c — it silently reads
 channel 0 every time, so per-channel probes come back identical across R/G/B (bit a

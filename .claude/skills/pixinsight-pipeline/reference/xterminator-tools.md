@@ -109,6 +109,14 @@ A flat single-band `denoise` raise trades both bands at once and eats detail.
 Pipeline config keys: `frequencySeparation`, `denoiseLf`, `denoiseLfColor`,
 `frequencyScale`, `denoiseColor` on any nxt_* step (helper `nxtLF()`).
 
+**`frequency_scale` is in PIXELS — set the crossover ABOVE the PSF.** The default
+5 px sat right on M82's PSF (FWHM 4.7" = 5.3 px at 2x-drizzle 0.88"/px; ~3.5-4 px
+post-BXT), so PSF-scale real detail (5-8 px knots) fell in the strongly-denoised LF
+band. Rule: crossover ≈ FWHM(px) + ~50% → 8 px for this rig, so everything that can
+possibly be real point-scale detail stays in the gentle HF band and LF only touches
+super-PSF blotch (10-50 px). Measure FWHM with SubframeSelector MeasureSubframes on
+the working master (column 5 of `P.measurements` row = FWHM, in scaleUnit units).
+
 ### Recommended Strategy: Multiple Light Passes
 Prefer multiple gentle applications over fewer heavy ones. Over-denoising causes:
 plastic/waxy look, faint star loss, blurred edges, color smearing, reduced depth.

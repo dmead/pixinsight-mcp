@@ -1,9 +1,27 @@
 # GHS (Generalized Hyperbolic Stretch) — Complete Reference
 
 ## Status
-- `GeneralizedHyperbolicStretch-pxm.dylib` is **NOT installed**
-- `new GeneralizedHyperbolicStretch` throws "is not defined"
-- Must use PixelMath fallback replicating the math from the GHS script
+- macOS box: module NOT installed — PixelMath fallback required (`ghsCode()` handles both)
+- Windows box: NATIVE module installed. PJSR params (introspected 2026-07-12):
+  `stretchType` (ST_GeneralisedHyperbolic=0, ST_MidtonesTransfer=1, ST_Arcsinh=2,
+  ST_PowerLaw=3, ST_Linear=4), `stretchFactor` (= ln(D+1), the GUI number),
+  `localIntensity` (b), `symmetryPoint`, `shadowProtection` (LP),
+  `highlightProtection` (HP), `blackPoint`/`whitePoint` (Linear mode),
+  `stretchChannel` (SC_RGB=3, SC_Lightness=4, SC_Saturation=5, SC_Colour=6),
+  `clipType` (CT_RGBBlend=2 default), `inverse`, `colourBlend`.
+
+## Dan's IFN-reveal recipe (2026-07-12, validated on M81/M82)
+The IFN is IN the stacked data, compressed against the sky — stretch it out of the
+finished image rather than adding a masked layer. Two GHS passes on the FINAL image:
+1. **Generalised Hyperbolic anchored at the sky**: SP = clicked sky sample (~sky
+   median; readout → Send to SP), ln(D+1) ≈ 3.36, b ≈ −1.8 (broad shoulder),
+   LP = 0, HP ≈ 0.89 (galaxies barely move).
+2. **Linear mode blackpoint re-anchor**: BP so the background settles ~0.10
+   (Dan's demo: BP 0.0228, LCP 0.0026 ≈ 0.26% clipped).
+Negative b spreads contrast broadly around SP instead of pinching it locally —
+that's what makes cirrus mottling emerge without posterizing the sky. If HP
+protection isn't enough, mask the galaxies and stretch the IFN separately (Dan).
+Script pattern: scratchpad ghs-ifn-30.js; result iteration_30_ghs.xisf.
 
 ## Origins
 GHS was proposed by **Dave Payne** (September 2021) as a unified framework for astronomical
