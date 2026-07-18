@@ -138,3 +138,28 @@ because the Ha_work existence check always returned 'yes'.
 dstWindow.copyAstrometricSolution(srcWindow);
 ```
 Essential after creating PixelMath composites — SPCC needs WCS data.
+
+## SubframeSelector Headless Measurement (measure-subs.js)
+`pjsr/measure-subs.js` + `scripts/select-subs.mjs` measure calibrated subs headlessly
+(FWHM, eccentricity, median, star count, PSFSignalWeight + a corner-box gradient
+metric) and statistically cull outliers before stacking. Validated on Sh2-101
+2026-07-18 (363 subs → 244 kept).
+
+**Measurement column layout is NOT what older docs say.** On PI 1.9.x the
+`P.measurements` row is: `index(0), enabled(1), locked(2), filePath(3), weight(4),
+FWHM(5), eccentricity(6), PSFSignalWeight(7), unused01(8), SNRWeight(9), median(10),
+medianMeanDev(11), noise(12), noiseRatio(13), stars(14), ... azimuth(19),
+altitude(20)`. Note `unused01` at index 8 shifting everything after it, and
+PSFSignalWeight at 7 (not appended at the end). Never trust remembered layouts —
+probe with `log(P.toSource())` + `JSON.stringify(P.measurements[0])` on 3 files
+first. `P.measurements` median is pedestal-corrected; a raw `image.median()` on the
+opened file is not.
+
+## Mixed Calibration Pedestals Poison Naive Background Metrics
+A calibrated-lights folder can silently mix pedestal conventions (some subs ~+0.0155
+pedestal, some none — even within the same night). Any metric using an absolute image
+median then splits into two bogus populations (observed: identical sky, "gradient"
+0.38 vs 0.046, purely from the denominator). Fixes: difference-based numerators
+(corner max−min cancels a constant pedestal) and the SubframeSelector
+pedestal-corrected median as denominator. Also: a center box on the target measures
+nebulosity, not gradient — use corner boxes only for gradient spread.
