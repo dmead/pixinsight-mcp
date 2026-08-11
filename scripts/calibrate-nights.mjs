@@ -131,6 +131,14 @@ const CAL_ROOT = `${T.work}/calibration`;
 const POOL = `${T.work}/lights`;
 
 const isLight = (n) => /\.(fits?|xisf)$/i.test(n);
+
+// Frames whose name carries no filter token were captured with the filter wheel
+// not reporting, so WBPP cannot group them and the stacker refuses them. The
+// Sh2-101 pool holds 4 (e.g. `2026-07-20_00-00-58__1.60_600.00s_0001_c.xisf` --
+// note the empty `__`), and the M82 set had 15. They are excluded from the pool
+// and listed, rather than being allowed to halt a step hours downstream.
+const FILTER_TOKENS = ['lum', 'red', 'green', 'blue', 'halpha', 'oxygen3', 'sulfur'];
+const FILTER_RE = new RegExp(`_(${FILTER_TOKENS.join('|')})_`, 'i');
 const lightsOfNight = (night) => {
   const dir = `${T.lightsRoot}/${night}/LIGHT`;
   return listFiles(dir, isLight).sort().map((n) => `${dir}/${n}`);
@@ -322,11 +330,13 @@ function stepPool() {
   const recal = recalibratedPrefixes();
   const chosen = new Map();   // basename -> source path
   const superseded = [];
+  const noFilter = [];
 
   for (const [dir, files] of poolSources()) {
     const isFresh = dir.startsWith(CAL_ROOT);
     for (const f of files) {
       const base = path.basename(f);
+      if (!FILTER_RE.test(base)) { noFilter.push(base); continue; }
       // A frame from an old pool whose night we just recalibrated is stale even
       // if the fresh run named it differently (e.g. it was never pooled before).
       const night = base.match(/^(\d{4}-\d{2}-\d{2})/)?.[1];
@@ -342,6 +352,11 @@ function stepPool() {
   console.log(`pool: ${chosen.size} frame(s) -> ${POOL}`);
   if (superseded.length)
     console.log(`  ${superseded.length} frame(s) dropped as superseded/stale`);
+  if (noFilter.length) {
+    console.warn(`  ${noFilter.length} frame(s) EXCLUDED — no filter token (wheel not reporting):`);
+    for (const n of noFilter) console.warn(`     ${n}`);
+    fs.writeFileSync(`${T.work}/no-filter-excluded.txt`, noFilter.join('\n') + '\n');
+  }
 
   // Hardlink where the source and the pool are on the same volume — the
   // Sh2-101 pool is ~700 frames at ~36 MB, and Z: is a local NTFS disk, so
