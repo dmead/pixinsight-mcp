@@ -136,9 +136,27 @@ const lightsOfNight = (night) => {
   return listFiles(dir, isLight).sort().map((n) => `${dir}/${n}`);
 };
 
-/** Calibrated frames WBPP wrote for a group, wherever it filed them. */
-const calibratedOf = (groupId) =>
-  walkFiles(`${CAL_ROOT}/${groupId}/calibrated`, (n) => /_c\.xisf$/i.test(n));
+/**
+ * Calibrated LIGHT frames WBPP wrote for a group.
+ *
+ * WBPP files calibrated frames under calibrated/<ImageType>_<geometry>_.../ and
+ * gives calibrated FLATS the same `_c.xisf` suffix as calibrated lights. A
+ * naive walk of calibrated/ therefore counts 1200 flats as progress: the first
+ * run of this script reported "complete after 3 min" with ZERO lights done,
+ * because 400 calibrated flats already exceeded the 44 lights it was waiting
+ * for — and then launched the next group's instance alongside the first one.
+ * Only Light_* subdirectories count.
+ */
+function calibratedOf(groupId) {
+  const base = `${CAL_ROOT}/${groupId}/calibrated`;
+  let dirs;
+  try {
+    dirs = fs.readdirSync(base, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && /^Light_/i.test(e.name))
+      .map((e) => `${base}/${e.name}`);
+  } catch { return []; }
+  return dirs.flatMap((d) => walkFiles(d, (n) => /_c\.xisf$/i.test(n)));
+}
 
 // ---------------------------------------------------------------------------
 // Step: plan
@@ -214,9 +232,15 @@ async function stepCalibrate() {
       console.log(`[${g.id}] already calibrated (${calibratedOf(g.id).length}/${lights.length}) — skipping`);
       continue;
     }
-    // A killed run leaves partial output that a rerun writes _1 copies beside.
-    if (fs.existsSync(outDir) && calibratedOf(g.id).length > 0)
-      throw new Error(`${outDir} holds a partial run — move it aside before rerunning`);
+    // A killed run leaves partial output, and WBPP writes _1 copies BESIDE it
+    // rather than replacing it, so anything globbing the tree later ingests
+    // both. A partial calibration has no salvage value -- the master flats it
+    // built are rebuilt in seconds -- so clear it rather than asking. This is
+    // only ever this script's own output directory.
+    if (fs.existsSync(outDir) && fs.readdirSync(outDir).length > 0) {
+      console.log(`[${g.id}] clearing partial run at ${outDir}`);
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
     ensureDir(outDir);
 
     const auditPath = `${outDir}/logs/calibration-builder-audit.txt`;
