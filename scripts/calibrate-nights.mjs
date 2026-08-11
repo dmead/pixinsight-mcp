@@ -75,7 +75,12 @@ const TARGETS = {
 
   bubble: {
     lightsRoot: 'Y:/BubbleNebula',
-    work: 'Y:/BubbleNebula/restack-2026-08',
+    // Lights are READ from Y: in place, but everything this run writes goes to
+    // Z:. Y: is the NAS (\\astronomy-nas\astronomy) and Z: is a local NTFS disk
+    // with 288 GB free: registration and integration read the pool many times
+    // over, and doing that across SMB would dominate the runtime. The pool is
+    // ~6.5 GB of calibrated frames, not a bulk raw migration.
+    work: 'Z:/bubble-restack',
     existingPools: ['Y:/BubbleNebula/all-calibrated-lights'],
     groups: [
       {
@@ -314,16 +319,27 @@ function stepPool() {
   if (superseded.length)
     console.log(`  ${superseded.length} frame(s) dropped as superseded/stale`);
 
-  let copied = 0, present = 0;
+  // Hardlink where the source and the pool are on the same volume — the
+  // Sh2-101 pool is ~700 frames at ~36 MB, and Z: is a local NTFS disk, so
+  // linking turns a 25 GB copy into a metadata operation. Falls back to a copy
+  // across volumes (Y: is an SMB share) or if the filesystem refuses the link.
+  let linked = 0, copied = 0, present = 0;
   for (const [base, src] of chosen) {
     const dst = `${POOL}/${base}`;
     if (fs.existsSync(dst) && fs.statSync(dst).size === fs.statSync(src).size) { ++present; continue; }
-    fs.copyFileSync(src, dst);
-    if (fs.statSync(dst).size !== fs.statSync(src).size)
-      throw new Error(`short copy: ${dst}`);
-    if (++copied % 25 === 0) console.log(`  ${copied} copied ...`);
+    fs.rmSync(dst, { force: true });
+    try {
+      fs.linkSync(src, dst);
+      ++linked;
+    } catch {
+      fs.copyFileSync(src, dst);
+      if (fs.statSync(dst).size !== fs.statSync(src).size)
+        throw new Error(`short copy: ${dst}`);
+      ++copied;
+    }
+    if ((linked + copied) % 50 === 0) console.log(`  ${linked + copied} placed ...`);
   }
-  console.log(`pool ready: ${copied} copied, ${present} already present, ${chosen.size} total`);
+  console.log(`pool ready: ${linked} linked, ${copied} copied, ${present} already present, ${chosen.size} total`);
 
   const byFilter = {};
   for (const base of chosen.keys()) {
