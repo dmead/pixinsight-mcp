@@ -1,8 +1,13 @@
-// stack-m82.mjs — rebuild the M81/M82 masters: CosmeticCorrection → headless
-// WBPP (register + local normalize + integrate + drizzle 2x) → per-filter drop
-// shrink optimization → final DrizzleIntegration masters.
+// stack-m82.mjs — rebuild masters from calibrated frames: CosmeticCorrection →
+// headless WBPP (register + local normalize + integrate + drizzle 2x) →
+// per-filter drop shrink optimization → final DrizzleIntegration masters.
 //
 // Stacking only. Nothing here stretches, combines or edits anything.
+//
+// Named for M81/M82 because that is what it was built on, but every path and
+// both tuning knobs are CLI-overridable, so it drives any target whose frames
+// follow the standard naming. Sh2-101 and Bubble Nebula run through it too; see
+// scripts/calibrate-nights.mjs for the calibration stage that feeds it.
 //
 // Run with the winget Node v24 binary (PATH node is v10 and dies on import):
 //   node scripts/stack-m82.mjs --step cc
@@ -10,6 +15,11 @@
 //   node scripts/stack-m82.mjs --step optimize [--filters lum,red]
 //   node scripts/stack-m82.mjs --step final
 //   node scripts/stack-m82.mjs --step verify
+//
+// Another target, overriding every path (M82 defaults are baked in):
+//   node scripts/stack-m82.mjs --step cc \
+//     --src Z:/sh2101-restack/lights --cc-out Z:/sh2101-restack/lights-cc \
+//     --work D:/Temp/sh2101-stack
 //
 // Every step is idempotent and judged by OUTPUT FILES, never by log activity or
 // process liveness — a PJSR script rewriting its log over SMB can look frozen
@@ -31,14 +41,22 @@ const SWAP = 'D:\\Temp\\pixinsight-swap';
 //   --wbpp-out <dir> WBPP output tree
 //   --opt-out <dir>  drop-shrink search output
 //   --masters <dir>  final masters
-const SRC = 'Z:/M82/all-cropped-no-overscan';
-const CC_OUT = 'Z:/M82/all-cc';
-let LIGHTS = CC_OUT;
+let SRC = 'Z:/M82/all-cropped-no-overscan';
+let CC_OUT = 'Z:/M82/all-cc';
+let LIGHTS = null;       // defaults to CC_OUT once the arguments are parsed
 let WBPP_OUT = 'Z:/M82/claude-wbpp';
 let OPT_OUT = 'Z:/M82/drizzle-optimizer/2026-08';
 let MASTERS = 'Z:/M82/claude-masters';
 let MIN_WEIGHT = 0.05;   // see wbppParams(); pass --min-weight 0 after sub selection
-const WORK = 'D:/Temp/m82-stack';
+// Exposure tiers merged into one group per filter. 600 covers M82's 60/300/600s;
+// the Sh2-101 and Bubble sets add a 900s O3 tier, so those runs pass 900.
+let EXPOSURE_TOLERANCE = 600;
+let WORK = 'D:/Temp/m82-stack';
+
+// Filters this rig shoots. sourceSubs() requires every frame to carry one of
+// these tokens: a frame with no filter in its name is a NoFilter capture (the
+// wheel not reporting), and those have silently reached an integration before.
+const FILTER_TOKENS = ['lum', 'red', 'green', 'blue', 'halpha', 'oxygen3', 'sulfur'];
 
 const CC_SCRIPT = `${ROOT}/pjsr/stack/cosmetic-correct.js`.replace(/\\/g, '/');
 const BUILDER_SCRIPT = `${ROOT}/pjsr/stack/wbpp-drizzle-builder.js`.replace(/\\/g, '/');
@@ -166,7 +184,8 @@ async function runInstance({ label, args, logPath, isDone, progress,
 // =====================================================================
 function sourceSubs() {
   const names = listFiles(SRC, (f) => f.toLowerCase().endsWith('.xisf'));
-  const bad = names.filter((n) => !/_(lum|red|green|blue|halpha)_/i.test(n));
+  const filterRe = new RegExp(`_(${FILTER_TOKENS.join('|')})_`, 'i');
+  const bad = names.filter((n) => !filterRe.test(n));
   if (bad.length > 0)
     throw new Error(`${bad.length} sub(s) in ${SRC} have no filter token — quarantine them first: ${bad.slice(0, 3).join(', ')}`);
   return names.map((n) => `${SRC}/${n}`);
@@ -210,8 +229,8 @@ const wbppParams = () => [
   // >=150 frames to FastIntegration, bypassing PSF weighting AND local
   // normalization. lum has 321 frames.
   'autoIntegrationMode=false',
-  // Merge the 60/300/600s tiers into one group per filter.
-  'lightExposureTolerancePost=600',
+  // Merge the exposure tiers into one group per filter.
+  `lightExposureTolerancePost=${EXPOSURE_TOLERANCE}`,
   'subframeWeightingEnabled=true',
   // Frames are still WEIGHTED by PSF signal, but minWeight also drives WBPP's
   // own pre-registration frame REJECTION. When sub selection has already been
@@ -524,13 +543,21 @@ let only = null;
 for (let i = 0; i < argv.length; ++i) {
   if (argv[i] === '--step') step = argv[++i];
   else if (argv[i] === '--filters') only = argv[++i].split(',').map((s) => s.trim().toLowerCase());
+  else if (argv[i] === '--src') SRC = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
+  else if (argv[i] === '--cc-out') CC_OUT = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
   else if (argv[i] === '--lights') LIGHTS = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
   else if (argv[i] === '--wbpp-out') WBPP_OUT = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
   else if (argv[i] === '--opt-out') OPT_OUT = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
   else if (argv[i] === '--masters') MASTERS = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
+  else if (argv[i] === '--work') WORK = argv[++i].replace(/\\/g, '/').replace(/\/+$/, '');
   else if (argv[i] === '--min-weight') MIN_WEIGHT = Number(argv[++i]);
+  else if (argv[i] === '--exposure-tolerance') EXPOSURE_TOLERANCE = Number(argv[++i]);
   else throw new Error(`Unknown argument: ${argv[i]}`);
 }
+
+// Resolved after parsing so that --cc-out alone still feeds the WBPP step, and
+// --lights can point it at a set that never went through CosmeticCorrection.
+if (LIGHTS === null) LIGHTS = CC_OUT;
 
 switch (step) {
   case 'cc': await stepCC(); break;
@@ -540,6 +567,8 @@ switch (step) {
   case 'recrop': await stepRecrop(); break;
   case 'verify': stepVerify(); break;
   default:
-    console.error('usage: stack-m82.mjs --step cc|wbpp|optimize|final|recrop|verify [--filters lum,red]');
+    console.error('usage: stack-m82.mjs --step cc|wbpp|optimize|final|recrop|verify [--filters lum,red]\n' +
+      '  paths:  --src --cc-out --lights --wbpp-out --opt-out --masters --work\n' +
+      '  tuning: --min-weight --exposure-tolerance');
     process.exitCode = 2;
 }
