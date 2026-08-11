@@ -33,7 +33,10 @@ import { fileURLToPath } from 'url';
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const PIX = 'C:/Program Files/PixInsight/bin/PixInsight.exe';
 const WBPP_JS = 'C:/Program Files/PixInsight/src/scripts/BatchPreprocessing/WBPP.js';
-const SWAP = 'D:\\Temp\\pixinsight-swap';
+// D: is down to ~9 GB free (2026-08-11) and exhausting swap mid-integration
+// raises a modal that suspends a headless instance indefinitely. Override with
+// PI_SWAP; Z: is also a local NTFS disk (only Y: is the NAS) with far more room.
+const SWAP = process.env.PI_SWAP || 'D:\\Temp\\pixinsight-swap';
 
 // Defaults describe the M82 run; every one is overridable so a rerun on a
 // different input set (e.g. after sub selection) needs no code change.

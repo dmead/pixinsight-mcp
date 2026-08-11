@@ -14,11 +14,17 @@ import fs from 'fs';
 export const PIX = 'C:/Program Files/PixInsight/bin/PixInsight.exe';
 export const WBPP_JS = 'C:/Program Files/PixInsight/src/scripts/BatchPreprocessing/WBPP.js';
 
-// C: is nearly full and D: is down to single-digit GB; every instance must be
-// pointed at the D: swap explicitly. ImageWindow.swapDirectories assignment is
-// INERT in PJSR — the TMP/TEMP environment override at launch is the only thing
+// Every instance must be pointed at a swap location explicitly. PixInsight
+// settings are per instance SLOT, so a `-n` instance gets the factory C: temp
+// default, and `ImageWindow.swapDirectories = [...]` in PJSR is an INERT
+// assignment — the TMP/TEMP environment override at launch is the only thing
 // that actually moves the swap.
-export const SWAP = 'D:\\Temp\\pixinsight-swap';
+//
+// D: is the historical location but is down to ~9 GB free (2026-08-11), and
+// running out mid-integration raises a modal that suspends a headless instance
+// indefinitely. Override with PI_SWAP for heavy runs; Z: is also a local NTFS
+// disk (only Y: is the NAS) and has far more room.
+export const SWAP = process.env.PI_SWAP || 'D:\\Temp\\pixinsight-swap';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const mins = (ms) => Math.round(ms / 60000);
