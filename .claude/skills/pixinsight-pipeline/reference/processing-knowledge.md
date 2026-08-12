@@ -248,6 +248,24 @@ Three things this changes:
 - **Seeing is not the reason.** FWHM and eccentricity are nearly flat with altitude here.
   The loss is signal throughput and sky brightness — extinction, not blur.
 
+**Use the cutoff for CAPTURE PLANNING, not for post-hoc culling — this was tested and the
+culling does not work.** Restacking Sh2-101 with the 40 degree cut applied (573 frames vs
+589, 557 vs 569 integrated, drizzle 2x, identical settings) produced masters that were
+very slightly *worse*:
+
+| | baseline 589 | alt-40 573 |
+|---|---:|---:|
+| Ha sigma | 1.49e-5 | 1.50e-5 |
+| Ha p95 | 20.2 | 20.1 |
+| S2 p95 | 10.4 | 10.3 |
+| O3 p95 | 5.7 | 5.6 |
+
+The 0.5–1.5% loss matches sqrt(97.3/100.2) = 1.5% almost exactly — i.e. the entire effect
+is the lost integration time and nothing else. WBPP already runs `subframeWeightingEnabled`
+with `minWeight=0.05`, so weak frames contribute in proportion to their quality; deleting
+them only removes their small positive contribution. **Do not hard-filter a pool by
+altitude.** Shoot above 40 degrees when planning the night; keep whatever you captured.
+
 **TIMESTAMP GOTCHA:** the frame *filename* stamp is **local time**; `DATE-OBS` in the
 header is **UTC**, and they differ by exactly 4 hours during EDT. Reading the filename as
 UTC puts every frame 4 hours early — it landed 12 Sh2-101 subs below the horizon before
