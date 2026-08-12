@@ -176,6 +176,43 @@
 | HDR headroom (RGB) | 0 | 0.05 | 0.05 |
 | Saturation method | curves | curves | hue_boost (selective) |
 
+## Measuring Channel SNR (and why the aperture matters)
+
+Tool: `scripts/channel-snr.mjs` — `--crop 1.0,0.5,0.25,0.12` (centred linear fractions),
+`--bg full|crop|both`. Run it on the **linear** masters before deciding a palette.
+
+**Never estimate noise with whole-frame MAD on a nebula target.** Extended emission is
+counted as scatter, so the channel with the most signal reports the most noise and the worst
+SNR. Measured that way the Tulip's Ha — the channel the object is brightest in — looked 3x
+noisier than S2. The same trap cost the M82 superlum its weighting. Instead: tile the frame,
+take the darkest ~10% of tiles as background, and estimate sigma from those tiles only.
+
+**An SNR or lit-fraction number is meaningless without the aperture it was measured over.**
+Quote the field with the figure. Measured on the Bubble SHO drizzle 2x masters (2026-08-12):
+
+| crop | field | Ha p95 | S2 p95 | O3 p95 | S2:Ha | O3:Ha |
+|---|---|---:|---:|---:|---:|---:|
+| 100% | 77′ | 8.7 | 4.5 | 3.4 | 0.51 | 0.39 |
+| 25% | 21′ | 29.6 | 7.2 | 6.2 | 0.24 | 0.21 |
+| 6% | 5′ | 95.6 | 15.4 | 25.4 | 0.16 | 0.27 |
+
+Two results worth generalising:
+
+- **Cropping onto the object does not flatten the channel ratios — it can widen them.**
+  Intuition says the wide field is Ha-dominated so cropping helps the weak channels. It went
+  the other way here: Ha gained 11x and S2 only 3.4x, because the field's brightest Ha sits
+  *on* the object, not around it. Predict nothing; measure the crop you intend to use.
+- **A channel that looks dead over a wide field may be fine on the object.** The Bubble's S2
+  reads 0.1% lit over 77′, which invites "there is no sulfur" — but at 5′ it is 34.7% of
+  pixels above 5σ. The wide-field figure was diluting a real 7 sq′ of shell emission across
+  5900 sq′ of empty sky.
+
+The dark-tile background is robust *while the frame still contains sky*. On the Bubble it
+shifted <1% from 77′ down to 10′ (the sky there is skyglow-dominated; the surrounding H II
+region sits below background). It fails when the crop is all object — the tell is **sigma
+inflating** rather than bg moving (Bubble Ha: 2.71e-5 at 100%, 2.97e-5 at 6%). Use
+`--bg full` to hold the baseline at the wide-field value so crops stay comparable.
+
 ## Quality Assessment Checklist
 1. **Background**: Clean, dark, no gradients or color casts?
 2. **Stars**: Natural shapes, no halos, good color variety?
