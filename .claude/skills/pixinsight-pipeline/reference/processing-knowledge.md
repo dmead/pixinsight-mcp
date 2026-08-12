@@ -213,6 +213,48 @@ region sits below background). It fails when the crop is all object — the tell
 inflating** rather than bg moving (Bubble Ha: 2.71e-5 at 100%, 2.97e-5 at 6%). Use
 `--bg full` to hold the baseline at the wide-field value so crops stay comparable.
 
+## Target Altitude Cutoff
+
+Tool: `scripts/altitude-quality.mjs` (joins a selection report to altitude at mid-exposure),
+`scripts/select-by-altitude.mjs` (applies a cutoff to a pool by hardlink).
+
+**Use 40 degrees.** Measured on 386 Sh2-101 subs at 39.93N, normalised within
+(filter, night):
+
+| altitude | airmass | FWHM | ecc | sky bg | stars | PSF signal |
+|---|---:|---:|---:|---:|---:|---:|
+| 30-40 | 1.74 | 1.05 | 0.99 | 1.11 | 0.87 | **0.68** |
+| 40-50 | 1.41 | 1.00 | 1.00 | 1.07 | 0.96 | 0.93 |
+| 50-60 | 1.22 | 1.00 | 1.00 | 1.00 | 0.96 | 0.91 |
+| 60-70 | 1.10 | 1.00 | 1.01 | 1.00 | 1.00 | 1.00 |
+| 80-90 | 1.00 | 0.99 | 0.93 | 0.89 | 1.02 | 1.04 |
+
+There is a cliff below 40 degrees and near-flat behaviour above it. Confirmed across five
+metrics, all Spearman significant and all in the physically correct direction: stars
+r=+0.41, PSF signal r=+0.35, sky bg r=−0.32, ecc r=−0.32, FWHM r=−0.18. Star count is a
+detection count and PSF signal is flux-weighted, so their agreement is genuine
+corroboration rather than one metric restated.
+
+Three things this changes:
+
+- **Normalise within night before trusting any altitude trend.** Altitude is confounded
+  with season — the low frames are mostly early-season nights when the target was still
+  rising, and those nights may simply have been worse. The raw binning showed a penalty
+  out to 50 degrees; the within-night control collapsed it to below 40. Without the
+  control you will set the cutoff too high.
+- **Do not raise the cutoff to buy quality.** Integration beats marginal per-sub quality:
+  40 degrees costs 16 of 589 frames (2.9 of 100.2 hours), 50 degrees costs 10.9 hours to
+  drop frames only ~7% worse, and 60 degrees costs a third of a season for ~9%.
+- **Seeing is not the reason.** FWHM and eccentricity are nearly flat with altitude here.
+  The loss is signal throughput and sky brightness — extinction, not blur.
+
+**TIMESTAMP GOTCHA:** the frame *filename* stamp is **local time**; `DATE-OBS` in the
+header is **UTC**, and they differ by exactly 4 hours during EDT. Reading the filename as
+UTC puts every frame 4 hours early — it landed 12 Sh2-101 subs below the horizon before
+this was caught. Always take capture time from `DATE-OBS`; a hardcoded offset breaks
+across the DST boundary. Note that grouping frames into *nights* by filename is still
+correct (roll times before 12:00 back a day), so cadence counts were unaffected.
+
 ## Quality Assessment Checklist
 1. **Background**: Clean, dark, no gradients or color casts?
 2. **Stars**: Natural shapes, no halos, good color variety?
